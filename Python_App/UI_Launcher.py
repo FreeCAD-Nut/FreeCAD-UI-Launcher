@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.0"
+APP_VERSION = "1.50.1"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -2307,76 +2307,143 @@ class ThemeLauncherApp(tk.Tk):
             return False
 
     def _spawn_post_exit_helper(self, pid: int, runtime_user_cfg: Path | None, cfg_path: Path | None, cleanup_dir: Path | None) -> None:
-        runtime_user_cfg_text = str(runtime_user_cfg.resolve()) if runtime_user_cfg is not None else None
-        cfg_path_text = str(cfg_path.resolve()) if cfg_path is not None else None
-        cleanup_dir_text = str(cleanup_dir.resolve()) if cleanup_dir is not None else None
-        helper_code = (
-            "import os\n"
-            "import shutil\n"
-            "import tempfile\n"
-            "import time\n"
-            "from pathlib import Path\n\n"
-            f"pid = {pid}\n"
-            f"runtime_user_cfg_text = {runtime_user_cfg_text!r}\n"
-            f"cfg_path_text = {cfg_path_text!r}\n"
-            f"cleanup_dir_text = {cleanup_dir_text!r}\n\n"
-            "runtime_user_cfg = Path(runtime_user_cfg_text) if runtime_user_cfg_text else None\n"
-            "cfg_path = Path(cfg_path_text) if cfg_path_text else None\n"
-            "cleanup_dir = Path(cleanup_dir_text) if cleanup_dir_text else None\n\n"
-            "def process_is_running(target_pid: int) -> bool:\n"
-            "    if os.name == 'nt':\n"
-            "        import ctypes\n"
-            "        SYNCHRONIZE = 0x00100000\n"
-            "        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, target_pid)\n"
-            "        if not handle:\n"
-            "            return False\n"
-            "        try:\n"
-            "            WAIT_TIMEOUT = 0x00000102\n"
-            "            result = ctypes.windll.kernel32.WaitForSingleObject(handle, 0)\n"
-            "            return result == WAIT_TIMEOUT\n"
-            "        finally:\n"
-            "            ctypes.windll.kernel32.CloseHandle(handle)\n"
-            "    try:\n"
-            "        os.kill(target_pid, 0)\n"
-            "        return True\n"
-            "    except OSError:\n"
-            "        return False\n\n"
-            "def is_safe_temporary_cleanup_dir(path):\n"
-            "    if path is None:\n"
-            "        return False\n"
-            "    try:\n"
-            "        resolved = path.resolve()\n"
-            "        temp_root = Path(tempfile.gettempdir()).resolve()\n"
-            "    except Exception:\n"
-            "        return False\n"
-            "    if not resolved.exists() or not resolved.is_dir():\n"
-            "        return False\n"
-            "    if resolved == temp_root:\n"
-            "        return False\n"
-            "    try:\n"
-            "        resolved.relative_to(temp_root)\n"
-            "    except ValueError:\n"
-            "        return False\n"
-            "    return resolved.name.startswith('.uix_')\n\n"
-            "while process_is_running(pid):\n"
-            "    time.sleep(1.0)\n\n"
-            "if runtime_user_cfg is not None and cfg_path is not None and runtime_user_cfg.exists():\n"
-            "    cfg_path.parent.mkdir(parents=True, exist_ok=True)\n"
-            "    shutil.copy2(runtime_user_cfg, cfg_path)\n\n"
-            "if is_safe_temporary_cleanup_dir(cleanup_dir):\n"
-            "    shutil.rmtree(cleanup_dir, ignore_errors=True)\n"
-        )
-        helper_path = Path(tempfile.gettempdir()) / f"ui_launcher_post_exit_{pid}.py"
-        helper_path.write_text(helper_code, encoding="utf-8")
-        kwargs = {}
+        runtime_user_cfg_text = str(runtime_user_cfg.resolve()) if runtime_user_cfg is not None else ""
+        cfg_path_text = str(cfg_path.resolve()) if cfg_path is not None else ""
+        cleanup_dir_text = str(cleanup_dir.resolve()) if cleanup_dir is not None else ""
+        helper_base = Path(tempfile.gettempdir()) / f"ui_launcher_post_exit_{pid}"
+
         if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+            def _ps_literal(value: str) -> str:
+                return "'" + value.replace("'", "''") + "'"
+
+            helper_path = helper_base.with_suffix(".ps1")
+            helper_code = textwrap.dedent(
+                f"""\
+                $ErrorActionPreference = 'SilentlyContinue'
+                $pidToWatch = {pid}
+                $runtimeUserCfg = {_ps_literal(runtime_user_cfg_text)}
+                $cfgPath = {_ps_literal(cfg_path_text)}
+                $cleanupDir = {_ps_literal(cleanup_dir_text)}
+
+                function Test-ProcessRunning([int]$TargetPid) {{
+                    try {{
+                        $null = Get-Process -Id $TargetPid -ErrorAction Stop
+                        return $true
+                    }} catch {{
+                        return $false
+                    }}
+                }}
+
+                function Test-SafeTemporaryCleanupDir([string]$PathText) {{
+                    if ([string]::IsNullOrWhiteSpace($PathText)) {{
+                        return $false
+                    }}
+                    try {{
+                        $resolved = [System.IO.Path]::GetFullPath($PathText)
+                        $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+                    }} catch {{
+                        return $false
+                    }}
+                    if (-not (Test-Path -LiteralPath $resolved -PathType Container)) {{
+                        return $false
+                    }}
+                    if ($resolved.TrimEnd('\') -eq $tempRoot.TrimEnd('\')) {{
+                        return $false
+                    }}
+                    if (-not $resolved.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase)) {{
+                        return $false
+                    }}
+                    return ([System.IO.Path]::GetFileName($resolved)).StartsWith('.uix_')
+                }}
+
+                while (Test-ProcessRunning $pidToWatch) {{
+                    Start-Sleep -Seconds 1
+                }}
+
+                if (-not [string]::IsNullOrWhiteSpace($runtimeUserCfg) -and -not [string]::IsNullOrWhiteSpace($cfgPath) -and (Test-Path -LiteralPath $runtimeUserCfg -PathType Leaf)) {{
+                    $parent = Split-Path -Parent $cfgPath
+                    if (-not [string]::IsNullOrWhiteSpace($parent)) {{
+                        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+                    }}
+                    Copy-Item -LiteralPath $runtimeUserCfg -Destination $cfgPath -Force
+                }}
+
+                if (Test-SafeTemporaryCleanupDir $cleanupDir) {{
+                    Remove-Item -LiteralPath $cleanupDir -Recurse -Force -ErrorAction SilentlyContinue
+                }}
+
+                Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+                """
+            )
+            helper_path.write_text(helper_code, encoding="utf-8")
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(helper_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            )
+            return
+
+        def _sh_literal(value: str) -> str:
+            return "'" + value.replace("'", "'\"'\"'") + "'"
+
+        helper_path = helper_base.with_suffix(".sh")
+        helper_code = textwrap.dedent(
+            f"""\
+            #!/bin/sh
+            pid_to_watch={pid}
+            runtime_user_cfg={_sh_literal(runtime_user_cfg_text)}
+            cfg_path={_sh_literal(cfg_path_text)}
+            cleanup_dir={_sh_literal(cleanup_dir_text)}
+
+            process_is_running() {{
+                kill -0 "$1" 2>/dev/null
+            }}
+
+            resolve_dir() {{
+                if [ -n "$1" ] && [ -d "$1" ]; then
+                    (cd "$1" 2>/dev/null && pwd -P)
+                fi
+            }}
+
+            temp_root=$(resolve_dir "${{TMPDIR:-/tmp}}")
+            cleanup_dir_resolved=$(resolve_dir "$cleanup_dir")
+
+            is_safe_temporary_cleanup_dir() {{
+                [ -n "$cleanup_dir_resolved" ] || return 1
+                [ -n "$temp_root" ] || return 1
+                [ "$cleanup_dir_resolved" != "$temp_root" ] || return 1
+                case "$cleanup_dir_resolved" in
+                    "$temp_root"/.uix_*) return 0 ;;
+                    *) return 1 ;;
+                esac
+            }}
+
+            while process_is_running "$pid_to_watch"; do
+                sleep 1
+            done
+
+            if [ -n "$runtime_user_cfg" ] && [ -n "$cfg_path" ] && [ -f "$runtime_user_cfg" ]; then
+                mkdir -p "$(dirname "$cfg_path")"
+                cp -f "$runtime_user_cfg" "$cfg_path"
+            fi
+
+            if is_safe_temporary_cleanup_dir; then
+                rm -rf "$cleanup_dir_resolved"
+            fi
+
+            rm -f "$0"
+            """
+        )
+        helper_path.write_text(helper_code, encoding="utf-8")
+        helper_path.chmod(0o700)
         subprocess.Popen(
-            [sys.executable, str(helper_path)],
+            ["/bin/sh", str(helper_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
-            **kwargs,
+            start_new_session=True,
         )
 
     def _launch_with_prepared_theme(
