@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.5"
+APP_VERSION = "1.50.6"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -1733,25 +1733,37 @@ class ThemeLauncherApp(tk.Tk):
         system = platform.system().lower()
         current = self.vars["freecad_executable"].get().strip()
         current_path = Path(current).expanduser() if current else None
-        initialdir = str(current_path.parent) if current_path and current_path.exists() else str(Path.home())
+
+        initialdir_path: Path | None = None
+        if current_path and current_path.exists():
+            if system == "darwin":
+                app_root = None
+                for candidate in [current_path, *current_path.parents]:
+                    if candidate.suffix.lower() == ".app":
+                        app_root = candidate
+                        break
+                initialdir_path = app_root.parent if app_root is not None else current_path.parent
+            else:
+                initialdir_path = current_path.parent
+        initialdir = str(initialdir_path) if initialdir_path else str(Path.home())
 
         if system == "darwin":
-            path = filedialog.askopenfilename(
+            path = filedialog.askdirectory(
                 title="Select FreeCAD.app",
                 initialdir=initialdir,
-                filetypes=[("macOS application", "*.app"), ("All files", "*")],
+                mustexist=True,
             )
             if not path:
                 return
             selected = Path(path).expanduser()
-            normalized = _normalize_freecad_executable_path(selected)
-            if selected.suffix.lower() != ".app" and normalized == selected:
+            if selected.suffix.lower() != ".app":
                 messagebox.showerror(APP_NAME, "Please select the FreeCAD.app application.")
                 return
+            normalized = _normalize_freecad_executable_path(selected)
             if normalized is None or not normalized.exists():
                 messagebox.showerror(APP_NAME, f"Could not find the FreeCAD executable inside:\n{selected}")
                 return
-            self.vars["freecad_executable"].set(str(normalized))
+            self.vars["freecad_executable"].set(str(selected))
             self.refresh_status()
             return
 

@@ -23,4 +23,9 @@ rm -rf "$DIST_DIR" "$BUILD_DIR" "$SPEC_DIR" "$OUTPUT_APP"
 pyinstaller   --noconfirm   --clean   --windowed   --name UI_Launcher   --distpath "$DIST_DIR"   --workpath "$BUILD_DIR"   --specpath "$SPEC_DIR"   --icon "$SOURCE_DIR/Default_Shortcut_Icons/Shortcut.icns"   --add-data "$SOURCE_DIR/Default_Shortcut_Icons:Default_Shortcut_Icons"   --add-data "$SOURCE_DIR/CC_Licenses:CC_Licenses"   "$SOURCE_DIR/UI_Launcher.py"
 
 cp -a "$DIST_DIR/UI_Launcher.app" "$OUTPUT_APP"
+
+# Apply an ad-hoc signature so the bundle has an internal code signature even
+# when no Developer ID certificate is available on the runner. This helps with
+# local testing but does not replace proper Developer ID signing + notarization.
+codesign --force --deep --sign - "$OUTPUT_APP"
 echo "Built: $OUTPUT_APP"
