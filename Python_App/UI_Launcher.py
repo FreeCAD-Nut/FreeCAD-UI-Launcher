@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.8"
+APP_VERSION = "1.50.9"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -117,6 +117,16 @@ def _launcher_entry_path() -> Path:
     if _is_frozen_app():
         return Path(sys.executable).resolve()
     return Path(__file__).resolve()
+
+
+def _current_macos_app_bundle() -> Path | None:
+    if platform.system().lower() != "darwin":
+        return None
+    executable_path = _launcher_entry_path()
+    for candidate in [executable_path, *executable_path.parents]:
+        if candidate.suffix.lower() == ".app":
+            return candidate
+    return None
 
 
 def _settings_storage_path(base_dir: Path) -> Path:
@@ -1796,11 +1806,15 @@ class ThemeLauncherApp(tk.Tk):
         initialdir = str(initialdir_path) if initialdir_path else str(Path.home())
 
         if system == "darwin":
-            path = filedialog.askdirectory(
-                title="Select FreeCAD.app",
-                initialdir=initialdir,
-                mustexist=True,
-            )
+            path = _macos_choose_application_path("Select the FreeCAD application.", "Select FreeCAD.app")
+            if path == "":
+                return
+            if path is None:
+                path = filedialog.askdirectory(
+                    title="Select FreeCAD.app",
+                    initialdir=initialdir,
+                    mustexist=True,
+                )
             if not path:
                 return
             selected = Path(path).expanduser()
@@ -1819,22 +1833,14 @@ class ThemeLauncherApp(tk.Tk):
             path = filedialog.askopenfilename(
                 title="Select FreeCAD.AppImage",
                 initialdir=initialdir,
-                filetypes=[("AppImage", "*.AppImage"), ("All files", "*.*")],
+                filetypes=[("FreeCAD AppImage", "*.AppImage"), ("All files", "*.*")],
             )
-            if not path:
-                return
-            selected = Path(path).expanduser()
-            if selected.suffix.lower() == ".appimage":
-                _ensure_linux_appimage_executable(selected)
-            self.vars["freecad_executable"].set(str(selected))
-            self.refresh_status()
-            return
-
-        path = filedialog.askopenfilename(
-            title="Select FreeCAD executable",
-            initialdir=initialdir,
-            filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
-        )
+        else:
+            path = filedialog.askopenfilename(
+                title="Select FreeCAD executable",
+                initialdir=initialdir,
+                filetypes=[("Executable", "*.exe"), ("All files", "*.*")],
+            )
         if path:
             self.vars["freecad_executable"].set(path)
             self.refresh_status()
@@ -2695,10 +2701,15 @@ class ThemeLauncherApp(tk.Tk):
     def _shortcut_target_and_args(self, mode: str) -> tuple[Path, list[str]]:
         mode_arg = "--launch-as-user" if mode == "user" else "--launch-as-creator"
         if _is_frozen_app():
-            if platform.system().lower() == "linux":
+            system = platform.system().lower()
+            if system == "linux":
                 appimage_path = os.environ.get("APPIMAGE", "").strip()
                 if appimage_path:
                     return Path(appimage_path).resolve(), [mode_arg]
+            if system == "darwin":
+                app_bundle = _current_macos_app_bundle()
+                if app_bundle is not None:
+                    return app_bundle, [mode_arg]
             return self.launcher_entry_path, [mode_arg]
         return Path(sys.executable).resolve(), [str(_launcher_entry_path()), mode_arg]
 
@@ -2729,10 +2740,15 @@ class ThemeLauncherApp(tk.Tk):
         resources_dir.mkdir(parents=True, exist_ok=True)
 
         launcher_script = macos_dir / shortcut_path.stem
-        command_parts = [str(target_path)] + arguments
+        if target_path.suffix.lower() == ".app":
+            command_parts = ["/usr/bin/open", "-n", str(target_path), "--args", *arguments]
+            working_dir = target_path.parent
+        else:
+            command_parts = [str(target_path)] + arguments
+            working_dir = target_path.parent
         launcher_script.write_text(
             "#!/bin/sh\n"
-            f'cd "{str(target_path.parent)}" || exit 1\n'
+            f'cd "{str(working_dir)}" || exit 1\n'
             f'exec {_shell_join(command_parts)}\n',
             encoding="utf-8",
         )
@@ -2743,26 +2759,38 @@ class ThemeLauncherApp(tk.Tk):
             icon_file_name = "shortcut.icns"
             shutil.copy2(icon_path, resources_dir / icon_file_name)
 
+        icon_plist_block = ""
+        if icon_file_name:
+            icon_plist_block = f"    <key>CFBundleIconFile</key>\n    <string>{icon_file_name}</string>\n"
+
         info_plist = contents / "Info.plist"
-        plist_text = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDisplayName</key>
-    <string>{shortcut_path.stem}</string>
-    <key>CFBundleExecutable</key>
-    <string>{shortcut_path.stem}</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.ui.launcher.shortcut.{shortcut_path.stem.lower().replace(" ", "-")}</string>
-    <key>CFBundleName</key>
-    <string>{shortcut_path.stem}</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    {f"<key>CFBundleIconFile</key>\n    <string>{icon_file_name}</string>" if icon_file_name else ""}
-</dict>
-</plist>
-"""
+        plist_text = (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            "<plist version=\"1.0\">\n"
+            "<dict>\n"
+            f"    <key>CFBundleDisplayName</key>\n    <string>{shortcut_path.stem}</string>\n"
+            f"    <key>CFBundleExecutable</key>\n    <string>{shortcut_path.stem}</string>\n"
+            f"    <key>CFBundleIdentifier</key>\n    <string>com.ui.launcher.shortcut.{shortcut_path.stem.lower().replace(' ', '-')}</string>\n"
+            f"    <key>CFBundleName</key>\n    <string>{shortcut_path.stem}</string>\n"
+            "    <key>CFBundlePackageType</key>\n    <string>APPL</string>\n"
+            f"{icon_plist_block}"
+            "</dict>\n"
+            "</plist>\n"
+        )
         info_plist.write_text(plist_text, encoding="utf-8")
+
+        codesign_path = Path("/usr/bin/codesign")
+        if codesign_path.exists():
+            try:
+                subprocess.run(
+                    [str(codesign_path), "--force", "--deep", "--sign", "-", str(app_dir)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
 
     def _create_linux_shortcut(self, shortcut_path: Path, target_path: Path, arguments: list[str], icon_path: Path | None) -> None:
         exec_parts = [_desktop_exec_escape(str(target_path))] + [_desktop_exec_escape(part) for part in arguments]
