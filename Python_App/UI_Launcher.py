@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.2"
+APP_VERSION = "1.50.3"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -146,6 +146,15 @@ def _ensure_linux_appimage_executable(appimage_path: Path) -> None:
             appimage_path.chmod(mode | 0o111)
     except Exception:
         pass
+
+
+def _is_linux_appimage_path(path: Path | str | None) -> bool:
+    if path is None:
+        return False
+    try:
+        return str(path).lower().endswith('.appimage')
+    except Exception:
+        return False
 
 
 def _shell_join(parts: list[str]) -> str:
@@ -2187,6 +2196,7 @@ class ThemeLauncherApp(tk.Tk):
         )
         runtime_user_home: Path | None = None
         runtime_splash_path: Path | None = None
+        runtime_freecad_splash_path: Path | None = None
         need_runtime_user_home = (
             self.settings.use_freecad_user_home
             or splash_path is not None
@@ -2199,7 +2209,9 @@ class ThemeLauncherApp(tk.Tk):
             images_dir = runtime_user_home / "Gui" / "Images"
             images_dir.mkdir(parents=True, exist_ok=True)
             runtime_splash_path = images_dir / "splash_image.png"
+            runtime_freecad_splash_path = images_dir / "freecadsplash.png"
             shutil.copy2(splash_path.resolve(), runtime_splash_path)
+            shutil.copy2(splash_path.resolve(), runtime_freecad_splash_path)
         helper_text_path, macro_path = self.write_reload_helper_files(runtime_root, runtime_user_home)
         runtime_startup_script_path: Path | None = None
         cmd = [str(Path(self.settings.freecad_executable).resolve()), "--user-cfg", str(runtime_user_cfg)]
@@ -2232,6 +2244,8 @@ class ThemeLauncherApp(tk.Tk):
             summary.append(f"Startup stylesheet script: {runtime_startup_script_path}")
         if runtime_splash_path is not None:
             summary.append(f"Runtime splash_image.png: {runtime_splash_path}")
+        if runtime_freecad_splash_path is not None:
+            summary.append(f"Runtime freecadsplash.png: {runtime_freecad_splash_path}")
         if self.settings.enable_external_icon_theme and icon_theme_root is not None:
             summary.append(f"FREECAD_EXTERNAL_ICON_THEME={icon_theme_root.resolve()}")
             summary.append("FREECAD_EXTERNAL_ICON_THEME_ENABLED=1")
@@ -2260,7 +2274,20 @@ class ThemeLauncherApp(tk.Tk):
         )
         return cmd, env, summary
 
-    def _wait_for_freecad_ready(self, process, timeout_seconds: float = 90.0) -> bool:
+    def _posix_process_group_is_active(self, process_group_id: int | None) -> bool:
+        if os.name == "nt" or process_group_id is None or process_group_id <= 0:
+            return False
+        try:
+            os.killpg(process_group_id, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+
+    def _wait_for_freecad_ready(self, process, timeout_seconds: float = 90.0, process_group_id: int | None = None) -> bool:
         start = time.time()
         pid = process.pid
         if os.name == "nt":
@@ -2273,13 +2300,27 @@ class ThemeLauncherApp(tk.Tk):
                 self.update()
                 time.sleep(0.25)
             return False
+
+        alive_since: float | None = None
+        grace_seconds = 5.0 if _is_linux_appimage_path(self.settings.freecad_executable) else 2.0
         while time.time() - start < timeout_seconds:
-            if process.poll() is not None:
-                return False
+            process_alive = process.poll() is None
+            group_alive = self._posix_process_group_is_active(process_group_id)
+            alive = process_alive or group_alive
+            now = time.time()
+            if alive:
+                if alive_since is None:
+                    alive_since = now
+                elif now - alive_since >= grace_seconds:
+                    return True
+            else:
+                if process.poll() is not None and alive_since is None:
+                    return False
+                alive_since = None
             self.update_idletasks()
             self.update()
             time.sleep(0.5)
-        return True
+        return alive_since is not None
 
     def _windows_process_has_visible_top_level_window(self, pid: int) -> bool:
         if os.name != "nt":
@@ -2306,7 +2347,7 @@ class ThemeLauncherApp(tk.Tk):
         except Exception:
             return False
 
-    def _spawn_post_exit_helper(self, pid: int, runtime_user_cfg: Path | None, cfg_path: Path | None, cleanup_dir: Path | None) -> None:
+    def _spawn_post_exit_helper(self, pid: int, runtime_user_cfg: Path | None, cfg_path: Path | None, cleanup_dir: Path | None, process_group_id: int | None = None) -> None:
         runtime_user_cfg_text = str(runtime_user_cfg.resolve()) if runtime_user_cfg is not None else ""
         cfg_path_text = str(cfg_path.resolve()) if cfg_path is not None else ""
         cleanup_dir_text = str(cleanup_dir.resolve()) if cleanup_dir is not None else ""
@@ -2420,7 +2461,7 @@ class ThemeLauncherApp(tk.Tk):
                 esac
             }}
 
-            while process_is_running "$pid_to_watch"; do
+            while process_is_running "$pid_to_watch" || process_group_is_running "$process_group_id"; do
                 sleep 1
             done
 
@@ -2553,6 +2594,10 @@ class ThemeLauncherApp(tk.Tk):
     def _shortcut_target_and_args(self, mode: str) -> tuple[Path, list[str]]:
         mode_arg = "--launch-as-user" if mode == "user" else "--launch-as-creator"
         if _is_frozen_app():
+            if platform.system().lower() == "linux":
+                appimage_path = os.environ.get("APPIMAGE", "").strip()
+                if appimage_path:
+                    return Path(appimage_path).resolve(), [mode_arg]
             return self.launcher_entry_path, [mode_arg]
         return Path(sys.executable).resolve(), [str(_launcher_entry_path()), mode_arg]
 
