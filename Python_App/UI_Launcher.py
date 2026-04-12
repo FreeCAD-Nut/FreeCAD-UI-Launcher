@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.9"
+APP_VERSION = "1.50.10"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -187,8 +187,55 @@ def _shell_join(parts: list[str]) -> str:
 
 
 def _desktop_exec_escape(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\"')
+    escaped = value.replace("\\", "\\\\").replace('"', '\\\"')
     return f'"{escaped}"'
+
+
+def _persistent_linux_shortcut_icon_path(shortcut_path: Path, source_icon_path: Path) -> Path:
+    icon_store_dir = _app_config_base_dir() / "Shortcut_Icons"
+    icon_store_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", shortcut_path.stem).strip("._") or "FreeCAD"
+    path_key = hashlib.sha1(str(shortcut_path.expanduser()).encode("utf-8")).hexdigest()[:10]
+    suffix = source_icon_path.suffix.lower() or ".png"
+    return icon_store_dir / f"{safe_name}_{path_key}{suffix}"
+
+
+def _make_linux_shortcut_icon_persistent(shortcut_path: Path, icon_path: Path | None) -> Path | None:
+    if icon_path is None or not icon_path.exists():
+        return None
+    persistent_icon_path = _persistent_linux_shortcut_icon_path(shortcut_path, icon_path)
+    persistent_icon_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(icon_path, persistent_icon_path)
+    return persistent_icon_path
+
+
+def _mark_linux_shortcut_trusted(shortcut_path: Path, icon_path: Path | None = None) -> None:
+    try:
+        os.chmod(shortcut_path, 0o755)
+    except Exception:
+        pass
+
+    gio_path = shutil.which("gio")
+    if not gio_path:
+        return
+
+    commands = [
+        [gio_path, "set", "-t", "string", str(shortcut_path), "metadata::trusted", "yes"],
+    ]
+    if icon_path is not None and icon_path.exists():
+        icon_uri = _path_to_file_uri(icon_path.resolve())
+        commands.append([gio_path, "set", "-t", "string", str(shortcut_path), "metadata::custom-icon", icon_uri])
+
+    for command in commands:
+        try:
+            subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
 
 
 
@@ -625,10 +672,32 @@ def _find_named_png(folder: Path, name_contains: str) -> Path | None:
     return sorted(matches, key=lambda p: p.name.lower())[0]
 
 
+def _find_linux_shortcut_icon_in_folder(folder: Path) -> Path | None:
+    entries = [
+        p for p in folder.iterdir()
+        if p.is_file() and p.suffix.lower() == ".png"
+    ]
+    if not entries:
+        return None
+
+    by_name = {p.name.lower(): p for p in entries}
+    for preferred_name in ("custom_icon.png", "shortcut.png"):
+        match = by_name.get(preferred_name)
+        if match is not None:
+            return match
+
+    for needle in ("custom_icon", "shortcut", "icon"):
+        matches = [p for p in entries if needle in p.stem.lower()]
+        if matches:
+            return sorted(matches, key=lambda p: p.name.lower())[0]
+
+    return sorted(entries, key=lambda p: p.name.lower())[0]
+
+
 def _find_platform_shortcut_icon_in_folder(folder: Path) -> Path | None:
     system = platform.system().lower()
     if system == "linux":
-        return _find_named_png(folder, "shortcut")
+        return _find_linux_shortcut_icon_in_folder(folder)
     wanted = _platform_shortcut_icon_suffix()
     matches = [
         p for p in folder.iterdir()
@@ -2794,6 +2863,7 @@ class ThemeLauncherApp(tk.Tk):
 
     def _create_linux_shortcut(self, shortcut_path: Path, target_path: Path, arguments: list[str], icon_path: Path | None) -> None:
         exec_parts = [_desktop_exec_escape(str(target_path))] + [_desktop_exec_escape(part) for part in arguments]
+        persistent_icon_path = _make_linux_shortcut_icon_persistent(shortcut_path, icon_path)
         desktop_text = f"""[Desktop Entry]
 Type=Application
 Version=1.0
@@ -2802,11 +2872,11 @@ Exec={' '.join(exec_parts)}
 Path={str(target_path.parent)}
 Terminal=false
 """
-        if icon_path is not None and icon_path.exists():
-            desktop_text += f"Icon={str(icon_path)}\n"
+        if persistent_icon_path is not None and persistent_icon_path.exists():
+            desktop_text += f"Icon={str(persistent_icon_path)}\n"
         desktop_text += "Categories=Graphics;Engineering;\n"
         shortcut_path.write_text(desktop_text, encoding="utf-8")
-        os.chmod(shortcut_path, 0o755)
+        _mark_linux_shortcut_trusted(shortcut_path, persistent_icon_path)
 
     def create_shortcut_clicked(self) -> None:
         self._collect_ui_to_settings()
