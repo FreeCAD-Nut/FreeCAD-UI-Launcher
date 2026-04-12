@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.3"
+APP_VERSION = "1.50.4"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -2195,8 +2195,7 @@ class ThemeLauncherApp(tk.Tk):
             stylesheet_text=runtime_qss_text,
         )
         runtime_user_home: Path | None = None
-        runtime_splash_path: Path | None = None
-        runtime_freecad_splash_path: Path | None = None
+        runtime_splash_paths: list[Path] = []
         need_runtime_user_home = (
             self.settings.use_freecad_user_home
             or splash_path is not None
@@ -2206,12 +2205,24 @@ class ThemeLauncherApp(tk.Tk):
             runtime_user_home = runtime_root / "user_home"
             runtime_user_home.mkdir(parents=True, exist_ok=True)
         if splash_path is not None and runtime_user_home is not None:
-            images_dir = runtime_user_home / "Gui" / "Images"
-            images_dir.mkdir(parents=True, exist_ok=True)
-            runtime_splash_path = images_dir / "splash_image.png"
-            runtime_freecad_splash_path = images_dir / "freecadsplash.png"
-            shutil.copy2(splash_path.resolve(), runtime_splash_path)
-            shutil.copy2(splash_path.resolve(), runtime_freecad_splash_path)
+            splash_source = splash_path.resolve()
+            splash_candidate_dirs = [
+                runtime_user_home / "Gui" / "Images",
+                runtime_user_home / "Gui" / "images",
+                runtime_user_home / "FreeCAD" / "Gui" / "Images",
+                runtime_user_home / "FreeCAD" / "Gui" / "images",
+            ]
+            seen_splash_targets: set[str] = set()
+            for images_dir in splash_candidate_dirs:
+                images_dir.mkdir(parents=True, exist_ok=True)
+                for splash_name in ("splash_image.png", "freecadsplash.png"):
+                    splash_target = images_dir / splash_name
+                    splash_target_key = str(splash_target.resolve()).lower() if os.name == "nt" else str(splash_target.resolve())
+                    if splash_target_key in seen_splash_targets:
+                        continue
+                    shutil.copy2(splash_source, splash_target)
+                    runtime_splash_paths.append(splash_target)
+                    seen_splash_targets.add(splash_target_key)
         helper_text_path, macro_path = self.write_reload_helper_files(runtime_root, runtime_user_home)
         runtime_startup_script_path: Path | None = None
         cmd = [str(Path(self.settings.freecad_executable).resolve()), "--user-cfg", str(runtime_user_cfg)]
@@ -2242,10 +2253,10 @@ class ThemeLauncherApp(tk.Tk):
             summary.append(f"FREECAD_USER_HOME={runtime_user_home}")
         if runtime_startup_script_path is not None:
             summary.append(f"Startup stylesheet script: {runtime_startup_script_path}")
-        if runtime_splash_path is not None:
-            summary.append(f"Runtime splash_image.png: {runtime_splash_path}")
-        if runtime_freecad_splash_path is not None:
-            summary.append(f"Runtime freecadsplash.png: {runtime_freecad_splash_path}")
+        if runtime_splash_paths:
+            summary.append("Runtime splash destinations:")
+            for splash_target in runtime_splash_paths:
+                summary.append(f"- {splash_target}")
         if self.settings.enable_external_icon_theme and icon_theme_root is not None:
             summary.append(f"FREECAD_EXTERNAL_ICON_THEME={icon_theme_root.resolve()}")
             summary.append("FREECAD_EXTERNAL_ICON_THEME_ENABLED=1")
