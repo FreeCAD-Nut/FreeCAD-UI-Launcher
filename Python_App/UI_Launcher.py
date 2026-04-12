@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.7"
+APP_VERSION = "1.50.8"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -183,7 +183,7 @@ def _desktop_exec_escape(value: str) -> str:
 
 
 def _applescript_quote(value: str) -> str:
-    return '"' + value.replace('\', '\\').replace('"', '\"') + '"'
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _run_macos_osascript(lines: list[str]) -> str | None:
