@@ -26,6 +26,8 @@ pyinstaller   --noconfirm   --clean   --onedir   --windowed   --name UI_Launcher
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 cp -a "$DIST_DIR/UI_Launcher/." "$APPDIR/usr/bin/"
 cp "$SOURCE_DIR/Default_Shortcut_Icons/Shortcut.png" "$APPDIR/usr/share/icons/hicolor/256x256/apps/UI_Launcher.png"
+cp "$SOURCE_DIR/Default_Shortcut_Icons/Shortcut.png" "$APPDIR/UI_Launcher.png"
+ln -sf "UI_Launcher.png" "$APPDIR/.DirIcon"
 
 cat > "$APPDIR/AppRun" <<'APP_RUN'
 #!/bin/sh
