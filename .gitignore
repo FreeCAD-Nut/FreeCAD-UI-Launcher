@@ -1,0 +1,44 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local launcher runtime and settings
+Python_App/UI_Launcher_settings.json
+Python_App/.UI_Launcher_runtime/
+**/.UI_Launcher_runtime/
+
+# Local test themes and exported packages
+*.fctheme
+
+# Build outputs created by the standalone packaging scripts
+Executable/**/build_work/
+Executable/**/dist/
+Executable/**/build/
+Executable/**/spec/
+Executable/Windows/UI_Launcher.exe
+Executable/Linux/UI_Launcher.AppImage
+Executable/macOS/UI_Launcher.app/
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+*.orig
+tmp/
+temp/
+out/
+artifacts/

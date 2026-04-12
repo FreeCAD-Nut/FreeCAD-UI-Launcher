@@ -1,0 +1,92 @@
+name: Build UI Launcher executables
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build Windows exe
+        shell: powershell
+        run: ./Executable/Windows/build_windows_exe.ps1
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UI_Launcher_Windows
+          path: Executable/Windows/UI_Launcher.exe
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Linux GUI dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+      - name: Download appimagetool
+        run: |
+          mkdir -p "$RUNNER_TEMP/appimage-tools"
+          curl -L -o "$RUNNER_TEMP/appimage-tools/appimagetool-x86_64.AppImage" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/appimage-tools/appimagetool-x86_64.AppImage"
+      - name: Build Linux AppImage
+        env:
+          APPIMAGETOOL_PATH: ${{ runner.temp }}/appimage-tools/appimagetool-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          chmod +x ./Executable/Linux/build_linux_appimage.sh
+          ./Executable/Linux/build_linux_appimage.sh
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UI_Launcher_Linux
+          path: Executable/Linux/UI_Launcher.AppImage
+          if-no-files-found: error
+
+  macos_apple_silicon:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build macOS Apple Silicon app
+        env:
+          OUTPUT_APP_NAME: UI_Launcher.app
+        run: |
+          chmod +x ./Executable/macOS/build_macos_app.sh
+          ./Executable/macOS/build_macos_app.sh
+      - name: Upload macOS Apple Silicon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UI_Launcher_macOS_Apple_Silicon
+          path: Executable/macOS/UI_Launcher.app
+          if-no-files-found: error
+
+  macos_intel:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build macOS Intel app
+        env:
+          OUTPUT_APP_NAME: UI_Launcher_Intel.app
+        run: |
+          chmod +x ./Executable/macOS/build_macos_app.sh
+          ./Executable/macOS/build_macos_app.sh
+      - name: Upload macOS Intel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UI_Launcher_macOS_Intel
+          path: Executable/macOS/UI_Launcher_Intel.app
+          if-no-files-found: error
