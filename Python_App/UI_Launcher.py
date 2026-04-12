@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.6"
+APP_VERSION = "1.50.7"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -179,6 +179,50 @@ def _shell_join(parts: list[str]) -> str:
 def _desktop_exec_escape(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\"')
     return f'"{escaped}"'
+
+
+
+def _applescript_quote(value: str) -> str:
+    return '"' + value.replace('\', '\\').replace('"', '\"') + '"'
+
+
+def _run_macos_osascript(lines: list[str]) -> str | None:
+    try:
+        command = ["/usr/bin/osascript"]
+        for line in lines:
+            command.extend(["-e", line])
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        stderr_text = (result.stderr or "").strip().lower()
+        if "user canceled" in stderr_text:
+            return ""
+        return None
+    return (result.stdout or "").strip()
+
+
+def _macos_choose_application_path(prompt: str, title: str) -> str | None:
+    return _run_macos_osascript([
+        f"set selectedApp to choose application with title {_applescript_quote(title)} with prompt {_applescript_quote(prompt)} as alias",
+        "return POSIX path of selectedApp",
+    ])
+
+
+def _macos_choose_folder_path(prompt: str, default_location: str | None = None) -> str | None:
+    command = f"set selectedFolder to choose folder with prompt {_applescript_quote(prompt)}"
+    if default_location:
+        command += f" default location (POSIX file {_applescript_quote(default_location)})"
+    command += " showing package contents false"
+    return _run_macos_osascript([command, "return POSIX path of selectedFolder"])
+
+
+def _macos_choose_file_path(prompt: str, default_location: str | None = None) -> str | None:
+    command = f"set selectedFile to choose file with prompt {_applescript_quote(prompt)}"
+    if default_location:
+        command += f" default location (POSIX file {_applescript_quote(default_location)})"
+    command += " showing package contents false"
+    return _run_macos_osascript([command, "return POSIX path of selectedFile"])
 
 RELOAD_MACRO_CONTENT = """import FreeCADGui as Gui\nGui.reloadExternalIconTheme()\n"""
 RELOAD_CONSOLE_COMMAND = "import FreeCADGui as Gui\nGui.reloadExternalIconTheme()"
@@ -1289,7 +1333,11 @@ class CreateShortcutDialog(tk.Toplevel):
 
     def _browse_location(self) -> None:
         current = self.location_var.get().strip() or str(Path.home())
-        path = filedialog.askdirectory(title="Select Shortcut Location", initialdir=current)
+        path = None
+        if platform.system().lower() == "darwin":
+            path = _macos_choose_folder_path("Select Shortcut Location", current)
+        if path is None:
+            path = filedialog.askdirectory(title="Select Shortcut Location", initialdir=current)
         if path:
             self.location_var.set(path)
 
@@ -1793,7 +1841,11 @@ class ThemeLauncherApp(tk.Tk):
 
     def browse_theme_folder(self) -> None:
         current = self.vars["theme_folder"].get().strip() or str(Path.home())
-        path = filedialog.askdirectory(title="Select Theme Folder", initialdir=current)
+        path = None
+        if platform.system().lower() == "darwin":
+            path = _macos_choose_folder_path("Select Theme Folder", current)
+        if path is None:
+            path = filedialog.askdirectory(title="Select Theme Folder", initialdir=current)
         if path:
             self.vars["theme_folder"].set(path)
             self.refresh_status()
@@ -1805,11 +1857,15 @@ class ThemeLauncherApp(tk.Tk):
             initialdir = str(Path(current).expanduser().parent)
         else:
             initialdir = self.vars["theme_folder"].get().strip() or str(Path.home())
-        path = filedialog.askopenfilename(
-            title="Select Theme File",
-            initialdir=initialdir,
-            filetypes=[("Theme files", f"*{THEME_PACKAGE_EXTENSION}"), ("All files", "*.*")],
-        )
+        path = None
+        if platform.system().lower() == "darwin":
+            path = _macos_choose_file_path("Select Theme File", initialdir)
+        if path is None:
+            path = filedialog.askopenfilename(
+                title="Select Theme File",
+                initialdir=initialdir,
+                filetypes=[("Theme files", f"*{THEME_PACKAGE_EXTENSION}"), ("All files", "*.*")],
+            )
         if path:
             self.vars["theme_file"].set(path)
             self._refresh_selected_theme_metadata()
