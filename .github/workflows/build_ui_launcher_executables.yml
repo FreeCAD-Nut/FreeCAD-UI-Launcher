@@ -64,11 +64,15 @@ jobs:
         run: |
           chmod +x ./Executable/macOS/build_macos_app.sh
           ./Executable/macOS/build_macos_app.sh
+      - name: Package macOS Apple Silicon app
+        run: |
+          cd ./Executable/macOS
+          ditto -c -k --sequesterRsrc --keepParent UI_Launcher.app UI_Launcher_macOS_Apple_Silicon.zip
       - name: Upload macOS Apple Silicon artifact
         uses: actions/upload-artifact@v4
         with:
           name: UI_Launcher_macOS_Apple_Silicon
-          path: Executable/macOS/UI_Launcher.app
+          path: Executable/macOS/UI_Launcher_macOS_Apple_Silicon.zip
           if-no-files-found: error
 
   macos_intel:
@@ -84,9 +88,13 @@ jobs:
         run: |
           chmod +x ./Executable/macOS/build_macos_app.sh
           ./Executable/macOS/build_macos_app.sh
+      - name: Package macOS Intel app
+        run: |
+          cd ./Executable/macOS
+          ditto -c -k --sequesterRsrc --keepParent UI_Launcher_Intel.app UI_Launcher_macOS_Intel.zip
       - name: Upload macOS Intel artifact
         uses: actions/upload-artifact@v4
         with:
           name: UI_Launcher_macOS_Intel
-          path: Executable/macOS/UI_Launcher_Intel.app
+          path: Executable/macOS/UI_Launcher_macOS_Intel.zip
           if-no-files-found: error
