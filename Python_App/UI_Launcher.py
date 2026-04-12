@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.4"
+APP_VERSION = "1.50.5"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -137,6 +137,19 @@ def _resolve_macos_app_executable(app_path: Path) -> Path | None:
             if child.is_file() and os.access(child, os.X_OK):
                 return child
     return None
+
+
+def _normalize_freecad_executable_path(path_text: str | Path | None) -> Path | None:
+    if path_text is None:
+        return None
+    raw_text = str(path_text).strip()
+    if not raw_text:
+        return None
+    candidate = Path(raw_text).expanduser()
+    if platform.system().lower() == "darwin" and candidate.suffix.lower() == ".app":
+        resolved = _resolve_macos_app_executable(candidate)
+        return resolved if resolved is not None else candidate
+    return candidate
 
 
 def _ensure_linux_appimage_executable(appimage_path: Path) -> None:
@@ -1723,18 +1736,22 @@ class ThemeLauncherApp(tk.Tk):
         initialdir = str(current_path.parent) if current_path and current_path.exists() else str(Path.home())
 
         if system == "darwin":
-            app_path = filedialog.askdirectory(title="Select FreeCAD.app", initialdir=initialdir, mustexist=True)
-            if not app_path:
+            path = filedialog.askopenfilename(
+                title="Select FreeCAD.app",
+                initialdir=initialdir,
+                filetypes=[("macOS application", "*.app"), ("All files", "*")],
+            )
+            if not path:
                 return
-            selected = Path(app_path).expanduser()
-            if selected.suffix.lower() != ".app":
+            selected = Path(path).expanduser()
+            normalized = _normalize_freecad_executable_path(selected)
+            if selected.suffix.lower() != ".app" and normalized == selected:
                 messagebox.showerror(APP_NAME, "Please select the FreeCAD.app application.")
                 return
-            resolved = _resolve_macos_app_executable(selected)
-            if resolved is None:
+            if normalized is None or not normalized.exists():
                 messagebox.showerror(APP_NAME, f"Could not find the FreeCAD executable inside:\n{selected}")
                 return
-            self.vars["freecad_executable"].set(str(resolved))
+            self.vars["freecad_executable"].set(str(normalized))
             self.refresh_status()
             return
 
@@ -2118,7 +2135,7 @@ class ThemeLauncherApp(tk.Tk):
         self._collect_ui_to_settings()
         errors: list[str] = []
         warnings: list[str] = []
-        exe = Path(self.settings.freecad_executable).expanduser() if self.settings.freecad_executable else None
+        exe = _normalize_freecad_executable_path(self.settings.freecad_executable)
         theme_folder = Path(self.settings.theme_folder).expanduser() if self.settings.theme_folder else None
         if not exe or not exe.exists():
             errors.append("FreeCAD executable is missing or does not exist.")
@@ -2225,7 +2242,10 @@ class ThemeLauncherApp(tk.Tk):
                     seen_splash_targets.add(splash_target_key)
         helper_text_path, macro_path = self.write_reload_helper_files(runtime_root, runtime_user_home)
         runtime_startup_script_path: Path | None = None
-        cmd = [str(Path(self.settings.freecad_executable).resolve()), "--user-cfg", str(runtime_user_cfg)]
+        resolved_freecad_executable = _normalize_freecad_executable_path(self.settings.freecad_executable)
+        if resolved_freecad_executable is None or not resolved_freecad_executable.exists():
+            raise LauncherError("FreeCAD executable is missing or does not exist.")
+        cmd = [str(resolved_freecad_executable.resolve()), "--user-cfg", str(runtime_user_cfg)]
         if runtime_qss_text:
             runtime_startup_script_path = runtime_root / "apply_runtime_stylesheet.FCMacro"
             _make_startup_stylesheet_script(runtime_startup_script_path, runtime_qss_text)
@@ -2243,6 +2263,8 @@ class ThemeLauncherApp(tk.Tk):
             env["FREECAD_EXTERNAL_ICON_THEME_PREFER_EXTERNAL"] = "1" if self.settings.prefer_external_icons else "0"
         summary: list[str] = []
         summary.append(f"Executable: {self.settings.freecad_executable}")
+        if str(resolved_freecad_executable) != str(self.settings.freecad_executable).strip():
+            summary.append(f"Resolved executable: {resolved_freecad_executable}")
         summary.append(f"{source_label}: {theme_folder}")
         summary.append(f"Config source: {cfg_source.resolve()}")
         summary.append(f"Detected .qss: {qss_path.resolve()}" if qss_path else "Detected .qss: none")
