@@ -46,7 +46,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.1"
+APP_VERSION = "1.50.2"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -2636,6 +2636,7 @@ Terminal=false
 
     def create_shortcut_clicked(self) -> None:
         self._collect_ui_to_settings()
+        self.save_settings()
         default_location = str(Path.home() / "Desktop")
         dialog = CreateShortcutDialog(self, default_name="FreeCAD", default_location=default_location)
         self.wait_window(dialog)
@@ -2715,15 +2716,23 @@ def _quote_arg(value: str) -> str:
 
 
 def _load_saved_settings_for_headless_launch() -> AppSettings:
-    settings_path = Path(__file__).resolve().parent / SETTINGS_FILE
-    if settings_path.exists():
-        try:
-            data = json.loads(settings_path.read_text(encoding="utf-8"))
-            defaults = asdict(AppSettings())
-            defaults.update(data)
-            return AppSettings(**defaults)
-        except Exception as exc:
-            raise LauncherError(f"Could not read saved settings:\n{exc}") from exc
+    settings_candidates: list[Path] = []
+    primary_settings_path = _settings_storage_path(_resource_base_dir())
+    settings_candidates.append(primary_settings_path)
+
+    legacy_local_settings_path = Path(__file__).resolve().parent / SETTINGS_FILE
+    if legacy_local_settings_path not in settings_candidates:
+        settings_candidates.append(legacy_local_settings_path)
+
+    for settings_path in settings_candidates:
+        if settings_path.exists():
+            try:
+                data = json.loads(settings_path.read_text(encoding="utf-8"))
+                defaults = asdict(AppSettings())
+                defaults.update(data)
+                return AppSettings(**defaults)
+            except Exception as exc:
+                raise LauncherError(f"Could not read saved settings:\n{exc}") from exc
 
     return AppSettings()
 
