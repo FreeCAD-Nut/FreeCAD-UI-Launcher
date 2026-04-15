@@ -38,15 +38,18 @@ import sys
 import time
 import tkinter as tk
 from datetime import datetime, timezone
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import Callable
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.50.10"
+APP_VERSION = "1.51.7"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -98,6 +101,11 @@ THEME_PACKAGE_TYPE = "freecad_ui_theme"
 THEME_SCHEMA_VERSION = "1.0"
 THEME_PAYLOAD_ENCRYPTION = "launcher_v1"
 THEME_PACKAGE_EXTENSION = ".fctheme"
+THEME_PACKAGE_OPTION_COMPLETE = "Complete Theme"
+THEME_PACKAGE_OPTION_ARTWORK_ONLY = "Artwork Only"
+THEME_PACKAGE_MODE_COMPLETE = "complete_theme"
+THEME_PACKAGE_MODE_ARTWORK_ONLY = "artwork_only"
+EXTERNAL_ASSET_METADATA_FILE = "external_assets.json"
 
 
 def _is_frozen_app() -> bool:
@@ -135,6 +143,12 @@ def _settings_storage_path(base_dir: Path) -> Path:
     return base_dir / SETTINGS_FILE
 
 
+def _freecad_executable_fallback_path(base_dir: Path) -> Path:
+    if _is_frozen_app():
+        return _app_config_base_dir() / "freecad_executable.txt"
+    return base_dir / "freecad_executable.txt"
+
+
 def _resolve_macos_app_executable(app_path: Path) -> Path | None:
     contents_macos = app_path / "Contents" / "MacOS"
     preferred_names = ["FreeCAD", "freecad"]
@@ -160,6 +174,76 @@ def _normalize_freecad_executable_path(path_text: str | Path | None) -> Path | N
         resolved = _resolve_macos_app_executable(candidate)
         return resolved if resolved is not None else candidate
     return candidate
+
+
+def _autodetect_freecad_executable_path() -> Path | None:
+    system = platform.system().lower()
+    seen: set[str] = set()
+    candidates: list[Path] = []
+
+    def _add(candidate: str | Path | None) -> None:
+        if candidate is None:
+            return
+        try:
+            resolved = _normalize_freecad_executable_path(candidate)
+        except Exception:
+            return
+        if resolved is None:
+            return
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(resolved)
+
+    for name in ("FreeCAD.exe", "FreeCAD", "freecad"):
+        try:
+            which_path = shutil.which(name)
+        except Exception:
+            which_path = None
+        _add(which_path)
+
+    if system == "windows":
+        search_roots: list[Path] = []
+        for env_name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            value = os.environ.get(env_name)
+            if value:
+                search_roots.append(Path(value))
+        patterns = (
+            "FreeCAD*/bin/FreeCAD.exe",
+            "FreeCAD */bin/FreeCAD.exe",
+            "FreeCAD/bin/FreeCAD.exe",
+            "FreeCAD*/FreeCAD.exe",
+            "FreeCAD */FreeCAD.exe",
+        )
+        for root in search_roots:
+            try:
+                for pattern in patterns:
+                    for match in sorted(root.glob(pattern)):
+                        _add(match)
+            except Exception:
+                continue
+    elif system == "darwin":
+        for candidate in (
+            Path('/Applications/FreeCAD.app'),
+            Path.home() / 'Applications' / 'FreeCAD.app',
+        ):
+            _add(candidate)
+    elif system == "linux":
+        for candidate in (
+            Path.home() / 'Applications' / 'FreeCAD.AppImage',
+            Path.home() / 'Desktop' / 'FreeCAD.AppImage',
+            Path('/opt/FreeCAD/bin/FreeCAD'),
+            Path('/usr/bin/freecad'),
+            Path('/usr/local/bin/freecad'),
+        ):
+            _add(candidate)
+
+    existing = [candidate for candidate in candidates if candidate.exists()]
+    if not existing:
+        return None
+    existing.sort(key=lambda item: (item.name.lower(), str(item).lower()))
+    return existing[0]
 
 
 def _ensure_linux_appimage_executable(appimage_path: Path) -> None:
@@ -191,7 +275,7 @@ def _desktop_exec_escape(value: str) -> str:
     return f'"{escaped}"'
 
 
-def _persistent_linux_shortcut_icon_path(shortcut_path: Path, source_icon_path: Path) -> Path:
+def _persistent_shortcut_icon_path(shortcut_path: Path, source_icon_path: Path) -> Path:
     icon_store_dir = _app_config_base_dir() / "Shortcut_Icons"
     icon_store_dir.mkdir(parents=True, exist_ok=True)
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", shortcut_path.stem).strip("._") or "FreeCAD"
@@ -200,10 +284,10 @@ def _persistent_linux_shortcut_icon_path(shortcut_path: Path, source_icon_path: 
     return icon_store_dir / f"{safe_name}_{path_key}{suffix}"
 
 
-def _make_linux_shortcut_icon_persistent(shortcut_path: Path, icon_path: Path | None) -> Path | None:
+def _make_shortcut_icon_persistent(shortcut_path: Path, icon_path: Path | None) -> Path | None:
     if icon_path is None or not icon_path.exists():
         return None
-    persistent_icon_path = _persistent_linux_shortcut_icon_path(shortcut_path, icon_path)
+    persistent_icon_path = _persistent_shortcut_icon_path(shortcut_path, icon_path)
     persistent_icon_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(icon_path, persistent_icon_path)
     return persistent_icon_path
@@ -307,6 +391,26 @@ class AppSettings:
     export_license_terms: str = ""
     export_license_notice_brief: str = DEFAULT_LICENSE_NOTICE_BRIEF
     export_license_notice: str = DEFAULT_LICENSE_NOTICE
+    export_theme_package: str = THEME_PACKAGE_OPTION_COMPLETE
+    export_require_external_cfg: bool = False
+    export_external_cfg_url: str = ""
+    export_require_external_qss: bool = False
+    export_external_qss_url: str = ""
+
+
+def _filtered_app_settings_payload(data: dict[str, object]) -> dict[str, object]:
+    allowed = {item.name for item in fields(AppSettings)}
+    return {key: value for key, value in data.items() if key in allowed}
+
+
+def _load_app_settings_from_path(settings_path: Path) -> AppSettings:
+    raw_data = json.loads(settings_path.read_text(encoding="utf-8"))
+    if not isinstance(raw_data, dict):
+        raise LauncherError(f"Saved settings file is not a JSON object:\n{settings_path}")
+    filtered = _filtered_app_settings_payload(raw_data)
+    defaults = asdict(AppSettings())
+    defaults.update(filtered)
+    return AppSettings(**defaults)
 
 
 def _slugify_theme_id(theme_name: str) -> str:
@@ -315,6 +419,95 @@ def _slugify_theme_id(theme_name: str) -> str:
     value = re.sub(r"_+", "_", value).strip("_")
     return value
 
+
+def _normalize_theme_package_value(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {THEME_PACKAGE_OPTION_ARTWORK_ONLY.lower(), THEME_PACKAGE_MODE_ARTWORK_ONLY}:
+        return THEME_PACKAGE_OPTION_ARTWORK_ONLY
+    return THEME_PACKAGE_OPTION_COMPLETE
+
+
+def _theme_package_manifest_value(value: str | None) -> str:
+    normalized = _normalize_theme_package_value(value)
+    if normalized == THEME_PACKAGE_OPTION_ARTWORK_ONLY:
+        return THEME_PACKAGE_MODE_ARTWORK_ONLY
+    return THEME_PACKAGE_MODE_COMPLETE
+
+
+def _is_artwork_only_theme_package(value: str | None) -> bool:
+    return _theme_package_manifest_value(value) == THEME_PACKAGE_MODE_ARTWORK_ONLY
+
+
+def _default_notice_values_for_theme_package(value: str | None) -> tuple[str, str]:
+    if _is_artwork_only_theme_package(value):
+        return "", ""
+    return DEFAULT_LICENSE_NOTICE_BRIEF, DEFAULT_LICENSE_NOTICE
+
+
+def _normalize_external_asset_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return raw
+    parsed = urllib_parse.urlparse(raw)
+    host = (parsed.netloc or "").lower()
+    path_parts = [part for part in (parsed.path or "").split("/") if part]
+
+    if host == "github.com" and len(path_parts) >= 5 and path_parts[2] == "blob":
+        owner, repo, _blob, branch = path_parts[:4]
+        remainder = "/".join(path_parts[4:])
+        normalized_path = f"/{owner}/{repo}/{branch}/{remainder}"
+        return urllib_parse.urlunparse(("https", "raw.githubusercontent.com", normalized_path, "", "", ""))
+
+    if host in {"www.dropbox.com", "dropbox.com"}:
+        query = urllib_parse.parse_qs(parsed.query, keep_blank_values=True)
+        query["dl"] = ["1"]
+        return urllib_parse.urlunparse(parsed._replace(query=urllib_parse.urlencode(query, doseq=True)))
+
+    return raw
+
+
+def _looks_like_html_bytes(data: bytes) -> bool:
+    head = data[:2048].decode("utf-8", errors="ignore").lstrip().lower()
+    return head.startswith("<!doctype html") or head.startswith("<html") or "<html" in head[:256]
+
+
+def _sanitize_xml_text_for_parse(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"&(?!#\d+;|#x[0-9a-fA-F]+;|[A-Za-z_][A-Za-z0-9_.:-]*;)", "&amp;", text)
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
+    return text
+
+
+def _parse_cfg_xml_permissive(source_user_cfg: Path) -> tuple[ET.ElementTree, ET.Element]:
+    try:
+        tree = ET.parse(source_user_cfg)
+        return tree, tree.getroot()
+    except Exception as first_exc:
+        raw_bytes = source_user_cfg.read_bytes()
+        if _looks_like_html_bytes(raw_bytes):
+            raise LauncherError(
+                "The downloaded .cfg file appears to be an HTML page instead of a direct XML file.\n"
+                f"Please use a direct-download URL for the .cfg file:\n{source_user_cfg}"
+            ) from first_exc
+        try:
+            sanitized_text = _sanitize_xml_text_for_parse(raw_bytes.decode("utf-8-sig", errors="replace"))
+            root = ET.fromstring(sanitized_text)
+            return ET.ElementTree(root), root
+        except Exception as second_exc:
+            raise LauncherError(
+                f"Could not parse the .cfg file as XML:\n{source_user_cfg}\n\n{second_exc}"
+            ) from second_exc
+
+
+def _external_asset_filename_from_url(url: str, expected_suffix: str) -> str:
+    normalized = _normalize_external_asset_url(url)
+    parsed = urllib_parse.urlparse(normalized)
+    filename = Path(urllib_parse.unquote(parsed.path or "")).name.strip()
+    if not filename:
+        raise LauncherError(f"Could not determine a file name from URL:\n{url}")
+    if Path(filename).suffix.lower() != expected_suffix.lower():
+        raise LauncherError(f"The URL must point to a {expected_suffix} file:\n{url}")
+    return filename
 
 def _canonical_manifest_bytes(manifest: dict[str, object]) -> bytes:
     return json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -370,8 +563,13 @@ def _top_level_theme_license_relpath(theme_folder: Path) -> str:
     return ""
 
 
-def _effective_export_file_list(scan: dict[str, object], theme_folder: Path, license_choice: str) -> list[str]:
+def _effective_export_file_list(scan: dict[str, object], theme_folder: Path, license_choice: str, theme_package: str = THEME_PACKAGE_OPTION_COMPLETE) -> list[str]:
     included_files = list(scan.get("included_files", []))
+    if _is_artwork_only_theme_package(theme_package):
+        included_files = [
+            rel for rel in included_files
+            if Path(rel).suffix.lower() not in {".cfg", ".qss"}
+        ]
     if license_choice == CUSTOM_LICENSE_OPTION:
         custom_rel = _top_level_theme_license_relpath(theme_folder)
         if custom_rel and custom_rel not in included_files:
@@ -441,8 +639,71 @@ def _app_config_base_dir() -> Path:
     return Path.home() / ".config" / APP_NAME
 
 
+def _theme_state_dir(theme_id: str) -> Path:
+    return _app_config_base_dir() / "Themes" / theme_id
+
+
 def _theme_user_cfg_path(theme_id: str) -> Path:
-    return _app_config_base_dir() / "Themes" / theme_id / "user.cfg"
+    return _theme_state_dir(theme_id) / "user.cfg"
+
+
+def _theme_external_assets_dir(theme_id: str) -> Path:
+    return _theme_state_dir(theme_id) / "External_Assets"
+
+
+def _theme_external_assets_metadata_path(theme_id: str) -> Path:
+    return _theme_external_assets_dir(theme_id) / EXTERNAL_ASSET_METADATA_FILE
+
+
+def _read_external_assets_metadata(theme_id: str) -> dict[str, object]:
+    path = _theme_external_assets_metadata_path(theme_id)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_external_assets_metadata(theme_id: str, data: dict[str, object]) -> None:
+    path = _theme_external_assets_metadata_path(theme_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _download_url_bytes(url: str, expected_suffix: str | None = None) -> bytes:
+    normalized_url = _normalize_external_asset_url(url)
+    request = urllib_request.Request(
+        normalized_url,
+        headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=30) as response:
+            data = response.read()
+    except urllib_error.HTTPError as exc:
+        raise LauncherError(f"Download failed ({exc.code}) for:\n{url}") from exc
+    except urllib_error.URLError as exc:
+        raise LauncherError(f"Could not download required external asset:\n{url}\n\n{exc}") from exc
+
+    if expected_suffix in {".cfg", ".qss"} and _looks_like_html_bytes(data):
+        raise LauncherError(
+            f"The URL did not return a direct {expected_suffix} file.\n"
+            "Please use a direct-download link, not a normal web page URL.\n\n"
+            f"URL:\n{url}\n\nResolved download URL:\n{normalized_url}"
+        )
+    return data
 
 
 def _make_obscured_temp_dir() -> Path:
@@ -626,13 +887,7 @@ class ConfigXML:
         if not source_user_cfg.exists():
             raise LauncherError(f"No .cfg file was found: {source_user_cfg}")
 
-        try:
-            tree = ET.parse(source_user_cfg)
-            root = tree.getroot()
-        except Exception as exc:
-            raise LauncherError(
-                f"Could not parse the .cfg file as XML:\n{source_user_cfg}\n\n{exc}"
-            ) from exc
+        tree, root = _parse_cfg_xml_permissive(source_user_cfg)
 
         group = cls._ensure_path(root, ["Preferences", "MainWindow"])
         if stylesheet_text:
@@ -642,6 +897,15 @@ class ConfigXML:
 
         destination_user_cfg.parent.mkdir(parents=True, exist_ok=True)
         tree.write(destination_user_cfg, encoding="utf-8", xml_declaration=True)
+
+    @classmethod
+    def write_default_user_cfg(cls, destination_user_cfg: Path, stylesheet_text: str | None = None) -> None:
+        root = ET.Element("FCParameters")
+        group = cls._ensure_path(root, ["Preferences", "MainWindow"])
+        if stylesheet_text:
+            cls._set_text_param(group, "StyleSheet", stylesheet_text)
+        destination_user_cfg.parent.mkdir(parents=True, exist_ok=True)
+        ET.ElementTree(root).write(destination_user_cfg, encoding="utf-8", xml_declaration=True)
 
 
 
@@ -998,8 +1262,14 @@ class ExportThemeDialog(tk.Toplevel):
         outer.bind("<Configure>", self._on_export_dialog_content_configure)
         self._scroll_canvas.bind("<Configure>", self._on_export_dialog_canvas_configure)
 
+        distribution = ttk.LabelFrame(outer, text="Distribution Model", padding=10)
+        distribution.pack(fill="x")
+        self._add_theme_package_dropdown_row(distribution, 0, "Theme Package", "theme_package")
+        self._add_checkbox_with_url_row(distribution, 1, "Require external configuration (.cfg)", "require_external_cfg", "external_cfg_url")
+        self._add_checkbox_with_url_row(distribution, 3, "Require external style-sheet (.qss)", "require_external_qss", "external_qss_url")
+
         metadata = ttk.LabelFrame(outer, text="Theme Metadata", padding=10)
-        metadata.pack(fill="x")
+        metadata.pack(fill="x", pady=(12, 0))
         self._add_entry_row(metadata, 0, "Theme Name", "theme_name")
         self._add_readonly_row(metadata, 1, "Theme ID", "theme_id")
         self._add_entry_row(metadata, 2, "Theme Version", "theme_version")
@@ -1132,6 +1402,33 @@ class ExportThemeDialog(tk.Toplevel):
         combo.bind("<<ComboboxSelected>>", self._on_license_choice_changed)
         parent.columnconfigure(1, weight=1)
 
+    def _add_theme_package_dropdown_row(self, parent, row, label, key):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+        options = [THEME_PACKAGE_OPTION_COMPLETE, THEME_PACKAGE_OPTION_ARTWORK_ONLY]
+        self.vars[key] = tk.StringVar(value=THEME_PACKAGE_OPTION_COMPLETE)
+        combo = ttk.Combobox(parent, textvariable=self.vars[key], values=options, state="readonly")
+        combo.grid(row=row, column=1, columnspan=3, sticky="ew", pady=4)
+        combo.bind("<<ComboboxSelected>>", self._on_theme_package_changed)
+        parent.columnconfigure(1, weight=1)
+
+    def _add_checkbox_with_url_row(self, parent, row, label, key, url_key):
+        if not hasattr(self, "_distribution_rows"):
+            self._distribution_rows = {}
+        self.vars[key] = tk.BooleanVar(value=False)
+        check = ttk.Checkbutton(parent, text=label, variable=self.vars[key], command=self._on_distribution_asset_toggle)
+        check.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 2))
+        self.vars[url_key] = tk.StringVar(value="")
+        url_label = ttk.Label(parent, text="Web Address")
+        url_label.grid(row=row + 1, column=0, sticky="w", padx=(18, 10), pady=(2, 4))
+        url_entry = ttk.Entry(parent, textvariable=self.vars[url_key])
+        url_entry.grid(row=row + 1, column=1, columnspan=3, sticky="ew", pady=(2, 4))
+        url_entry.bind("<KeyRelease>", lambda _e: self._refresh_summary())
+        self._distribution_rows[key] = {
+            "check": check,
+            "url_label": url_label,
+            "url_entry": url_entry,
+        }
+
     def _add_text_row(self, parent, row, label, key, height):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="nw", padx=(0, 10), pady=(6, 4))
         frame = ttk.Frame(parent)
@@ -1171,6 +1468,43 @@ class ExportThemeDialog(tk.Toplevel):
         self._apply_license_choice_defaults(license_choice)
         self._refresh_summary()
 
+    def _sync_distribution_ui_visibility(self) -> None:
+        artwork_only = _is_artwork_only_theme_package(self.vars["theme_package"].get())
+        for key in ("require_external_cfg", "require_external_qss"):
+            row = getattr(self, "_distribution_rows", {}).get(key)
+            if not row:
+                continue
+            if artwork_only:
+                row["check"].grid()
+                if bool(self.vars[key].get()):
+                    row["url_label"].grid()
+                    row["url_entry"].grid()
+                else:
+                    row["url_label"].grid_remove()
+                    row["url_entry"].grid_remove()
+            else:
+                row["check"].grid_remove()
+                row["url_label"].grid_remove()
+                row["url_entry"].grid_remove()
+
+    def _on_theme_package_changed(self, _event=None) -> None:
+        theme_package = _normalize_theme_package_value(self.vars["theme_package"].get())
+        self.vars["theme_package"].set(theme_package)
+        if _is_artwork_only_theme_package(theme_package):
+            self._set_text_widget("license_notice_brief", "")
+            self._set_text_widget("license_notice", "")
+        else:
+            if not self._get_text_widget("license_notice_brief"):
+                self._set_text_widget("license_notice_brief", DEFAULT_LICENSE_NOTICE_BRIEF)
+            if not self._get_text_widget("license_notice"):
+                self._set_text_widget("license_notice", DEFAULT_LICENSE_NOTICE)
+        self._sync_distribution_ui_visibility()
+        self._refresh_summary()
+
+    def _on_distribution_asset_toggle(self) -> None:
+        self._sync_distribution_ui_visibility()
+        self._refresh_summary()
+
     def _populate_from_settings(self):
         s = self.master.settings
         self.vars["theme_name"].set(s.export_theme_name)
@@ -1180,6 +1514,11 @@ class ExportThemeDialog(tk.Toplevel):
         self.vars["author_key_file"].set(s.author_key_file)
         self._set_text_widget("description", s.export_description)
         self._set_text_widget("copyright", s.export_copyright)
+        self.vars["theme_package"].set(_normalize_theme_package_value(getattr(s, "export_theme_package", THEME_PACKAGE_OPTION_COMPLETE)))
+        self.vars["require_external_cfg"].set(bool(getattr(s, "export_require_external_cfg", False)))
+        self.vars["external_cfg_url"].set(str(getattr(s, "export_external_cfg_url", "") or ""))
+        self.vars["require_external_qss"].set(bool(getattr(s, "export_require_external_qss", False)))
+        self.vars["external_qss_url"].set(str(getattr(s, "export_external_qss_url", "") or ""))
         self._suppress_license_choice_events = True
         license_options = _license_options_for_dir(self.master.base_dir)
         saved_license = str(getattr(s, "export_license", CUSTOM_LICENSE_OPTION) or CUSTOM_LICENSE_OPTION)
@@ -1191,8 +1530,10 @@ class ExportThemeDialog(tk.Toplevel):
         if not license_brief and saved_license != CUSTOM_LICENSE_OPTION:
             license_brief = _default_license_brief_for_choice(saved_license)
         self._set_text_widget("license_terms", license_brief)
-        self._set_text_widget("license_notice_brief", str(getattr(s, "export_license_notice_brief", DEFAULT_LICENSE_NOTICE_BRIEF) or DEFAULT_LICENSE_NOTICE_BRIEF))
-        self._set_text_widget("license_notice", str(getattr(s, "export_license_notice", DEFAULT_LICENSE_NOTICE) or DEFAULT_LICENSE_NOTICE))
+        default_notice_brief, default_notice = _default_notice_values_for_theme_package(self.vars["theme_package"].get())
+        self._set_text_widget("license_notice_brief", str(getattr(s, "export_license_notice_brief", default_notice_brief) or default_notice_brief))
+        self._set_text_widget("license_notice", str(getattr(s, "export_license_notice", default_notice) or default_notice))
+        self._sync_distribution_ui_visibility()
         self.vars["schema_version"].set(THEME_SCHEMA_VERSION)
         self.vars["package_type"].set(THEME_PACKAGE_TYPE)
         self.vars["launcher_version"].set(APP_VERSION)
@@ -1247,6 +1588,11 @@ class ExportThemeDialog(tk.Toplevel):
             "author_key_file": self.vars["author_key_file"].get().strip(),
             "description": self._get_text_widget("description"),
             "copyright": self._get_text_widget("copyright"),
+            "theme_package": _normalize_theme_package_value(self.vars["theme_package"].get().strip()),
+            "require_external_cfg": bool(self.vars["require_external_cfg"].get()),
+            "external_cfg_url": self.vars["external_cfg_url"].get().strip(),
+            "require_external_qss": bool(self.vars["require_external_qss"].get()),
+            "external_qss_url": self.vars["external_qss_url"].get().strip(),
             "license": self.vars["license"].get().strip(),
             "license_terms": self._get_text_widget("license_terms"),
             "license_notice_brief": self._get_text_widget("license_notice_brief"),
@@ -1257,6 +1603,8 @@ class ExportThemeDialog(tk.Toplevel):
 
     def _validate(self, values):
         errors = []
+        theme_package = values.get("theme_package", THEME_PACKAGE_OPTION_COMPLETE)
+        artwork_only = _is_artwork_only_theme_package(theme_package)
         if not values["theme_name"]:
             errors.append("Theme Name is required.")
         if not values["theme_id"]:
@@ -1302,14 +1650,35 @@ class ExportThemeDialog(tk.Toplevel):
                     errors.append(str(exc))
         included_files = self.scan.get("included_files", [])
         counts = self.scan.get("counts", {})
-        if not included_files:
+        effective_included_files = _effective_export_file_list(self.scan, self._current_theme_folder_path(), values.get("license", ""), theme_package)
+        if not effective_included_files:
             errors.append("No exportable theme files were found in the Theme Folder.")
-        if counts.get(".cfg", 0) == 0:
-            errors.append("Exactly one .cfg file is required, but none was found.")
-        elif counts.get(".cfg", 0) > 1:
-            errors.append("Exactly one .cfg file is required, but multiple .cfg files were found.")
         if counts.get(".svg", 0) + counts.get(".png", 0) == 0:
             errors.append("The Theme Folder must contain at least one .svg or .png asset.")
+        if not artwork_only:
+            if counts.get(".cfg", 0) == 0:
+                errors.append("Exactly one .cfg file is required, but none was found.")
+            elif counts.get(".cfg", 0) > 1:
+                errors.append("Exactly one .cfg file is required, but multiple .cfg files were found.")
+        else:
+            if values.get("require_external_cfg"):
+                cfg_url = values.get("external_cfg_url", "")
+                if not cfg_url:
+                    errors.append("Web Address is required for external configuration (.cfg).")
+                else:
+                    try:
+                        _external_asset_filename_from_url(cfg_url, ".cfg")
+                    except Exception as exc:
+                        errors.append(str(exc))
+            if values.get("require_external_qss"):
+                qss_url = values.get("external_qss_url", "")
+                if not qss_url:
+                    errors.append("Web Address is required for external style-sheet (.qss).")
+                else:
+                    try:
+                        _external_asset_filename_from_url(qss_url, ".qss")
+                    except Exception as exc:
+                        errors.append(str(exc))
         return errors
 
     def _refresh_summary(self):
@@ -1320,7 +1689,7 @@ class ExportThemeDialog(tk.Toplevel):
         self.vars["png_count"].set(str(counts.get(".png", 0)))
         self.vars["qss_count"].set(str(counts.get(".qss", 0)))
         self.vars["cfg_count"].set(str(counts.get(".cfg", 0)))
-        effective_included_files = _effective_export_file_list(self.scan, self._current_theme_folder_path(), values.get("license", ""))
+        effective_included_files = _effective_export_file_list(self.scan, self._current_theme_folder_path(), values.get("license", ""), values.get("theme_package", THEME_PACKAGE_OPTION_COMPLETE))
         self.vars["total_files"].set(str(len(effective_included_files)))
         if not values["author_key_file"]:
             self.vars["key_fingerprint"].set("")
@@ -1352,6 +1721,11 @@ class ExportThemeDialog(tk.Toplevel):
         s.export_license_terms = values["license_terms"]
         s.export_license_notice_brief = values["license_notice_brief"]
         s.export_license_notice = values["license_notice"]
+        s.export_theme_package = values["theme_package"]
+        s.export_require_external_cfg = bool(values["require_external_cfg"])
+        s.export_external_cfg_url = values["external_cfg_url"]
+        s.export_require_external_qss = bool(values["require_external_qss"])
+        s.export_external_qss_url = values["external_qss_url"]
         self.master.settings_path.write_text(json.dumps(asdict(self.master.settings), indent=2, ensure_ascii=False), encoding="utf-8")
 
     def _export_clicked(self):
@@ -1441,6 +1815,89 @@ class CreateShortcutDialog(tk.Toplevel):
         self.destroy()
 
 
+class LicenseAndExternalAssetsDialog(tk.Toplevel):
+    def __init__(self, parent: tk.Misc, metadata: dict[str, str], on_download: Callable[[], None]) -> None:
+        super().__init__(parent)
+        self.title("License and external assets")
+        self.resizable(True, False)
+        self.transient(parent)
+        self.grab_set()
+        self.metadata = metadata
+        self.on_download = on_download
+        self.completed = False
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+
+        message = (
+            "This theme contains Artwork only and requires external configuration and stylesheet files."
+        )
+        ttk.Label(body, text=message, wraplength=520, justify="left").grid(row=0, column=0, sticky="w")
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(buttons, text="License", command=self._show_license).pack(side="left")
+        ttk.Button(buttons, text="License Notice", command=self._show_license_notice).pack(side="left", padx=(8, 0))
+
+        self.accept_var = tk.BooleanVar(value=False)
+        checkbox_text = (
+            "I have read and agree to the License and the License Notice, and I understand that proceeding will download the required external assets."
+        )
+        ttk.Checkbutton(
+            body,
+            text=checkbox_text,
+            variable=self.accept_var,
+            command=self._sync_download_state,
+        ).grid(row=2, column=0, sticky="w", pady=(14, 0))
+
+        self.download_button = ttk.Button(body, text="Download Required External Assets", command=self._download_clicked)
+        self.download_button.grid(row=3, column=0, sticky="w", pady=(12, 0))
+
+        footer = ttk.Frame(body)
+        footer.grid(row=4, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(footer, text="Close", command=self._close).pack(side="right")
+
+        self._sync_download_state()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.update_idletasks()
+        self.minsize(max(620, self.winfo_reqwidth()), self.winfo_reqheight())
+
+    def _sync_download_state(self) -> None:
+        self.download_button.configure(state=("normal" if self.accept_var.get() else "disabled"))
+
+    def _show_license(self) -> None:
+        content = str(self.metadata.get("license_text", "") or "").strip()
+        if not content:
+            messagebox.showinfo(APP_NAME, "No packaged license text is available in the loaded theme.", parent=self)
+            return
+        cast_parent = self.master
+        if hasattr(cast_parent, "_show_scrollable_text_popup"):
+            cast_parent._show_scrollable_text_popup("License", content, owner=self)
+
+    def _show_license_notice(self) -> None:
+        content = str(self.metadata.get("license_notice", "") or "").strip()
+        if not content:
+            messagebox.showinfo(APP_NAME, "No License Notice text is available in the loaded theme.", parent=self)
+            return
+        cast_parent = self.master
+        if hasattr(cast_parent, "_show_scrollable_text_popup"):
+            cast_parent._show_scrollable_text_popup("License Notice", content, owner=self)
+
+    def _download_clicked(self) -> None:
+        try:
+            self.on_download()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+            return
+        self.completed = True
+        messagebox.showinfo(APP_NAME, "Required external assets downloaded successfully.", parent=self)
+        self.destroy()
+
+    def _close(self) -> None:
+        self.destroy()
+
+
 class ThemeLauncherApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1452,8 +1909,10 @@ class ThemeLauncherApp(tk.Tk):
         self.base_dir = _resource_base_dir()
         self.launcher_entry_path = _launcher_entry_path()
         self.settings_path = _settings_storage_path(self.base_dir)
+        self.freecad_executable_fallback_path = _freecad_executable_fallback_path(self.base_dir)
         self.settings = self.load_settings()
         self.vars: dict[str, tk.Variable] = {}
+        self.entries: dict[str, ttk.Entry] = {}
         self._resize_after_id = None
 
         self._build_ui()
@@ -1464,11 +1923,9 @@ class ThemeLauncherApp(tk.Tk):
     def load_settings(self) -> AppSettings:
         if self.settings_path.exists():
             try:
-                data = json.loads(self.settings_path.read_text(encoding="utf-8"))
-                defaults = asdict(AppSettings())
-                defaults.update(data)
-                settings = AppSettings(**defaults)
-                if "export_license" not in data or not str(getattr(settings, "export_license", "") or "").strip():
+                settings = _load_app_settings_from_path(self.settings_path)
+                persisted = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                if "export_license" not in persisted or not str(getattr(settings, "export_license", "") or "").strip():
                     theme_folder_text = str(getattr(settings, "theme_folder", "") or "").strip()
                     if theme_folder_text:
                         theme_folder = Path(theme_folder_text).expanduser()
@@ -1478,19 +1935,103 @@ class ThemeLauncherApp(tk.Tk):
                             settings.export_license = CUSTOM_LICENSE_OPTION
                     else:
                         settings.export_license = CUSTOM_LICENSE_OPTION
+                if not str(getattr(settings, "freecad_executable", "") or "").strip():
+                    fallback_executable = self._read_freecad_executable_fallback()
+                    if fallback_executable:
+                        settings.freecad_executable = fallback_executable
                 return settings
             except Exception:
                 pass
 
         return AppSettings()
 
-    def save_settings(self) -> None:
-        self._collect_ui_to_settings()
+    def _write_settings_file(self) -> None:
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings_path.write_text(
             json.dumps(asdict(self.settings), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    def save_settings(self) -> None:
+        self._collect_ui_to_settings()
+        self._write_settings_file()
         self.status("Settings saved.")
+
+    def _persist_settings_silently(self) -> None:
+        self._collect_ui_to_settings()
+        self._write_settings_file()
+        self._write_freecad_executable_fallback()
+
+    def _write_freecad_executable_fallback(self, value: str | None = None) -> None:
+        raw_value = str(value if value is not None else self._current_entry_text("freecad_executable") or getattr(self.settings, "freecad_executable", "") or "").strip()
+        path = getattr(self, "freecad_executable_fallback_path", None)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if raw_value:
+                path.write_text(raw_value, encoding="utf-8")
+            elif path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+    def _read_freecad_executable_fallback(self) -> str:
+        path = getattr(self, "freecad_executable_fallback_path", None)
+        if path is None or not Path(path).exists():
+            return ""
+        try:
+            return str(Path(path).read_text(encoding="utf-8")).strip()
+        except Exception:
+            return ""
+
+    def _resolve_effective_freecad_executable(self) -> tuple[Path | None, str]:
+        candidate_texts: list[str] = []
+
+        def _remember(candidate: str) -> None:
+            value = str(candidate or "").strip().strip('"').strip()
+            if value and value not in candidate_texts:
+                candidate_texts.append(value)
+
+        _remember(self._current_entry_text("freecad_executable"))
+        _remember(str(getattr(self.settings, "freecad_executable", "") or "").strip())
+        _remember(self._read_freecad_executable_fallback())
+
+        settings_candidates = [self.settings_path]
+        legacy_local_settings_path = Path(__file__).resolve().parent / SETTINGS_FILE
+        if legacy_local_settings_path not in settings_candidates:
+            settings_candidates.append(legacy_local_settings_path)
+
+        for settings_candidate in settings_candidates:
+            if not settings_candidate.exists():
+                continue
+            try:
+                persisted = json.loads(settings_candidate.read_text(encoding="utf-8"))
+                _remember(str(persisted.get("freecad_executable", "") or "").strip())
+            except Exception:
+                pass
+
+        autodetected = _autodetect_freecad_executable_path()
+        if autodetected is not None:
+            _remember(str(autodetected))
+
+        first_nonempty = candidate_texts[0] if candidate_texts else ""
+        for candidate_text in candidate_texts:
+            resolved = _normalize_freecad_executable_path(candidate_text)
+            if resolved is not None and resolved.exists():
+                self.settings.freecad_executable = candidate_text
+                if self.vars.get("freecad_executable") is not None:
+                    try:
+                        self.vars["freecad_executable"].set(candidate_text)
+                    except Exception:
+                        pass
+                try:
+                    self._write_settings_file()
+                except Exception:
+                    pass
+                self._write_freecad_executable_fallback(candidate_text)
+                return resolved, candidate_text
+        return _normalize_freecad_executable_path(first_nonempty), first_nonempty
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self, padding=12)
@@ -1667,10 +2208,14 @@ class ThemeLauncherApp(tk.Tk):
         theme_path = Path(theme_text).expanduser()
         return theme_path.exists() and theme_path.is_file()
 
-    def _show_scrollable_text_popup(self, title: str, content: str) -> None:
-        popup = tk.Toplevel(self)
+    def _show_scrollable_text_popup(self, title: str, content: str, owner: tk.Misc | None = None) -> None:
+        popup_parent = owner if owner is not None else self
+        popup = tk.Toplevel(popup_parent)
         popup.title(title)
-        popup.transient(self)
+        try:
+            popup.transient(popup_parent)
+        except Exception:
+            popup.transient(self)
         popup.resizable(True, True)
         popup.minsize(520, 360)
 
@@ -1688,13 +2233,36 @@ class ThemeLauncherApp(tk.Tk):
         text_widget.insert("1.0", content)
         text_widget.configure(state="disabled")
 
+        def _close_popup() -> None:
+            try:
+                popup.grab_release()
+            except Exception:
+                pass
+            popup.destroy()
+            if owner is not None:
+                try:
+                    owner.grab_set()
+                    owner.focus_force()
+                except Exception:
+                    pass
+
         buttons = ttk.Frame(shell)
         buttons.grid(row=1, column=0, columnspan=2, sticky="e", pady=(12, 0))
-        ttk.Button(buttons, text="Close", command=popup.destroy).pack(side="right")
+        ttk.Button(buttons, text="Close", command=_close_popup).pack(side="right")
 
+        popup.protocol("WM_DELETE_WINDOW", _close_popup)
         popup.update_idletasks()
         popup.geometry("700x600")
-        popup.focus_set()
+        try:
+            popup.grab_set()
+        except Exception:
+            pass
+        try:
+            popup.attributes("-topmost", True)
+            popup.after(250, lambda: popup.attributes("-topmost", False))
+        except Exception:
+            pass
+        popup.focus_force()
 
     def show_loaded_theme_license_notice(self) -> None:
         metadata = getattr(self, "loaded_theme_metadata", {}) or {}
@@ -1711,6 +2279,116 @@ class ThemeLauncherApp(tk.Tk):
             messagebox.showinfo(APP_NAME, "No packaged license text is available in the loaded theme.", parent=self)
             return
         self._show_scrollable_text_popup("License", content)
+
+    def _loaded_theme_requires_external_assets(self, metadata: dict[str, str] | None = None) -> bool:
+        info = metadata if metadata is not None else (getattr(self, "loaded_theme_metadata", {}) or {})
+        if not info:
+            return False
+        if not _is_artwork_only_theme_package(info.get("theme_package", "")):
+            return False
+        return info.get("require_external_cfg") == "1" or info.get("require_external_qss") == "1"
+
+    def _download_required_external_assets_from_metadata(self, metadata: dict[str, str]) -> dict[str, Path]:
+        self._persist_critical_paths()
+        theme_id = str(metadata.get("theme_id", "") or "").strip()
+        if not theme_id:
+            raise LauncherError("The loaded theme is missing a valid theme_id.")
+        assets_dir = _theme_external_assets_dir(theme_id)
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        stored = _read_external_assets_metadata(theme_id)
+        result: dict[str, Path] = {}
+
+        if metadata.get("require_external_cfg") == "1":
+            cfg_url = str(metadata.get("external_cfg_url", "") or "").strip()
+            cfg_filename = str(metadata.get("external_cfg_filename", "") or "").strip() or _external_asset_filename_from_url(cfg_url, ".cfg")
+            cfg_bytes = _download_url_bytes(cfg_url, expected_suffix=".cfg")
+            cfg_path = assets_dir / cfg_filename
+            cfg_path.write_bytes(cfg_bytes)
+            result["cfg"] = cfg_path
+            stored["cfg"] = {
+                "url": cfg_url,
+                "filename": cfg_filename,
+                "sha256": _sha256_bytes(cfg_bytes),
+                "downloaded_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+
+        if metadata.get("require_external_qss") == "1":
+            qss_url = str(metadata.get("external_qss_url", "") or "").strip()
+            qss_filename = str(metadata.get("external_qss_filename", "") or "").strip() or _external_asset_filename_from_url(qss_url, ".qss")
+            qss_bytes = _download_url_bytes(qss_url, expected_suffix=".qss")
+            qss_path = assets_dir / qss_filename
+            qss_path.write_bytes(qss_bytes)
+            result["qss"] = qss_path
+            stored["qss"] = {
+                "url": qss_url,
+                "filename": qss_filename,
+                "sha256": _sha256_bytes(qss_bytes),
+                "downloaded_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+
+        _write_external_assets_metadata(theme_id, stored)
+        try:
+            self._persist_settings_silently()
+        except Exception:
+            pass
+        return result
+
+    def _validate_required_external_assets(self, manifest: dict[str, object]) -> tuple[dict[str, Path], list[str]]:
+        theme_id = str(manifest.get("theme_id", "") or "").strip()
+        result: dict[str, Path] = {}
+        errors: list[str] = []
+        stored = _read_external_assets_metadata(theme_id)
+        assets_dir = _theme_external_assets_dir(theme_id)
+
+        if bool(manifest.get("require_external_cfg")):
+            cfg_filename = str(manifest.get("external_cfg_filename", "") or "").strip()
+            cfg_path = assets_dir / cfg_filename
+            if not cfg_filename or not cfg_path.exists() or not cfg_path.is_file():
+                errors.append(f"Required external configuration (.cfg) is missing:\n{cfg_path}")
+            else:
+                result["cfg"] = cfg_path
+
+        if bool(manifest.get("require_external_qss")):
+            qss_filename = str(manifest.get("external_qss_filename", "") or "").strip()
+            qss_path = assets_dir / qss_filename
+            qss_meta = stored.get("qss") if isinstance(stored.get("qss"), dict) else {}
+            expected_hash = str(qss_meta.get("sha256", "") or "").strip()
+            if not qss_filename or not qss_path.exists() or not qss_path.is_file():
+                errors.append(f"Required external style-sheet (.qss) is missing:\n{qss_path}")
+            elif not expected_hash:
+                errors.append("Required external style-sheet (.qss) metadata is missing. Please download the required external assets again.")
+            else:
+                current_hash = _sha256_path(qss_path)
+                if current_hash != expected_hash:
+                    errors.append("Required external style-sheet (.qss) has been modified or is invalid. Please download the required external assets again.")
+                else:
+                    result["qss"] = qss_path
+
+        return result, errors
+
+    def _prompt_for_required_external_assets(self, theme_file: Path, metadata: dict[str, str]) -> bool:
+        if not self._loaded_theme_requires_external_assets(metadata):
+            return True
+        dialog = LicenseAndExternalAssetsDialog(
+            self,
+            metadata,
+            on_download=lambda: self._download_required_external_assets_from_metadata(metadata),
+        )
+        self.wait_window(dialog)
+        return bool(dialog.completed)
+
+    def _ensure_required_external_assets_ready(self, theme_file: Path, manifest: dict[str, object]) -> dict[str, Path]:
+        metadata = _read_theme_package_metadata(theme_file)
+        if not self._loaded_theme_requires_external_assets(metadata):
+            return {}
+        assets, errors = self._validate_required_external_assets(manifest)
+        if not errors:
+            return assets
+        self._prompt_for_required_external_assets(theme_file, metadata)
+        assets, errors = self._validate_required_external_assets(manifest)
+        if errors:
+            raise LauncherError("\n".join(errors))
+        return assets
 
     def _update_dynamic_window_size(self) -> None:
         self.update_idletasks()
@@ -1734,12 +2412,57 @@ class ThemeLauncherApp(tk.Tk):
                 pass
         self._resize_after_id = self.after(25, self._update_dynamic_window_size)
 
+    def _current_entry_text(self, key: str) -> str:
+        entry = self.entries.get(key)
+        if entry is not None:
+            try:
+                return str(entry.get()).strip()
+            except Exception:
+                pass
+        var = self.vars.get(key)
+        if var is not None:
+            try:
+                return str(var.get()).strip()
+            except Exception:
+                pass
+        return str(getattr(self.settings, key, "") or "").strip()
+
+    def _persist_path_field(self, key: str) -> None:
+        if not hasattr(self.settings, key):
+            return
+        value = self._current_entry_text(key)
+        if key in self.vars:
+            try:
+                self.vars[key].set(value)
+            except Exception:
+                pass
+        setattr(self.settings, key, value)
+        try:
+            self._write_settings_file()
+        except Exception:
+            pass
+        if key == "freecad_executable":
+            self._write_freecad_executable_fallback(value)
+
+    def _persist_critical_paths(self) -> None:
+        for key in ("freecad_executable", "theme_folder", "theme_file"):
+            self._persist_path_field(key)
+
     def _add_path_row(self, parent: ttk.Frame, row: int, label: str, key: str, browse_command) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
         self.vars[key] = tk.StringVar(value="")
         entry = ttk.Entry(parent, textvariable=self.vars[key])
+        self.entries[key] = entry
         entry.grid(row=row, column=1, sticky="ew", pady=4)
-        entry.bind("<KeyRelease>", lambda _e: self.refresh_status())
+        def _on_key_release(_e, _key=key):
+            self.refresh_status()
+            if _key in {"freecad_executable", "theme_folder", "theme_file"}:
+                try:
+                    self.after_idle(lambda: self._persist_path_field(_key))
+                except Exception:
+                    pass
+        entry.bind("<KeyRelease>", _on_key_release)
+        entry.bind("<FocusOut>", lambda _e, _key=key: self._persist_path_field(_key))
         ttk.Button(parent, text="Browse", command=browse_command).grid(row=row, column=2, sticky="ew", padx=(8, 0), pady=4)
 
     def _refresh_selected_theme_metadata(self) -> None:
@@ -1844,7 +2567,10 @@ class ThemeLauncherApp(tk.Tk):
             if key in ("use_external_icons", "user_mode", "creator_mode"):
                 continue
             if hasattr(self.settings, key):
-                setattr(self.settings, key, var.get())
+                if key in {"freecad_executable", "theme_folder", "theme_file"}:
+                    setattr(self.settings, key, self._current_entry_text(key))
+                else:
+                    setattr(self.settings, key, var.get())
 
     def _sync_external_icon_settings_from_ui(self) -> None:
         use_external_icons = bool(self.vars["use_external_icons"].get())
@@ -1895,6 +2621,7 @@ class ThemeLauncherApp(tk.Tk):
                 messagebox.showerror(APP_NAME, f"Could not find the FreeCAD executable inside:\n{selected}")
                 return
             self.vars["freecad_executable"].set(str(selected))
+            self._persist_settings_silently()
             self.refresh_status()
             return
 
@@ -1912,6 +2639,7 @@ class ThemeLauncherApp(tk.Tk):
             )
         if path:
             self.vars["freecad_executable"].set(path)
+            self._persist_settings_silently()
             self.refresh_status()
 
     def browse_theme_folder(self) -> None:
@@ -1923,6 +2651,7 @@ class ThemeLauncherApp(tk.Tk):
             path = filedialog.askdirectory(title="Select Theme Folder", initialdir=current)
         if path:
             self.vars["theme_folder"].set(path)
+            self._persist_settings_silently()
             self.refresh_status()
 
 
@@ -1943,8 +2672,12 @@ class ThemeLauncherApp(tk.Tk):
             )
         if path:
             self.vars["theme_file"].set(path)
+            self._persist_settings_silently()
             self._refresh_selected_theme_metadata()
             self.refresh_status()
+            metadata = getattr(self, "loaded_theme_metadata", {}) or {}
+            if self._loaded_theme_requires_external_assets(metadata):
+                self._prompt_for_required_external_assets(Path(path).expanduser(), metadata)
 
     def _scan_theme_folder_for_export(self) -> dict[str, object]:
         self._collect_ui_to_settings()
@@ -2006,13 +2739,19 @@ class ThemeLauncherApp(tk.Tk):
 
     def _create_theme_package(self, values: dict[str, str], scan: dict[str, object], output_path: Path) -> tuple[dict[str, object], Path]:
         theme_folder = Path(self.settings.theme_folder).expanduser().resolve()
-        included_files = list(scan["included_files"])
+        theme_package = values.get("theme_package", THEME_PACKAGE_OPTION_COMPLETE)
+        included_files = _effective_export_file_list(scan, theme_folder, values.get("license", ""), theme_package)
         license_relpath = self._prepare_license_file_for_export(values, theme_folder)
         if license_relpath and license_relpath not in included_files:
             included_files.append(license_relpath)
         included_files = sorted(set(included_files), key=str.lower)
-        default_cfg_relpath = str(scan["detected_cfg"])
+        artwork_only = _is_artwork_only_theme_package(theme_package)
+        default_cfg_relpath = "" if artwork_only else str(scan["detected_cfg"])
         default_splash_relpath = str(scan.get("detected_splash", "") or "")
+        external_cfg_url = values.get("external_cfg_url", "") if artwork_only and values.get("require_external_cfg") else ""
+        external_qss_url = values.get("external_qss_url", "") if artwork_only and values.get("require_external_qss") else ""
+        external_cfg_filename = _external_asset_filename_from_url(external_cfg_url, ".cfg") if external_cfg_url else ""
+        external_qss_filename = _external_asset_filename_from_url(external_qss_url, ".qss") if external_qss_url else ""
         private_key, public_pem, fingerprint = _load_author_private_key(Path(values["author_key_file"]).expanduser())
         payload_buffer = io.BytesIO()
         with zipfile.ZipFile(payload_buffer, "w", zipfile.ZIP_DEFLATED) as payload_zip:
@@ -2035,6 +2774,13 @@ class ThemeLauncherApp(tk.Tk):
             "license_terms": values["license_terms"],
             "license_notice_brief": values["license_notice_brief"],
             "license_notice": values["license_notice"],
+            "theme_package": _theme_package_manifest_value(theme_package),
+            "require_external_cfg": bool(artwork_only and values.get("require_external_cfg")),
+            "external_cfg_url": external_cfg_url,
+            "external_cfg_filename": external_cfg_filename,
+            "require_external_qss": bool(artwork_only and values.get("require_external_qss")),
+            "external_qss_url": external_qss_url,
+            "external_qss_filename": external_qss_filename,
             "payload_encryption": THEME_PAYLOAD_ENCRYPTION,
             "payload_hash_sha256": hashlib.sha256(encrypted_payload).hexdigest(),
             "payload_size_bytes": len(encrypted_payload),
@@ -2104,7 +2850,9 @@ class ThemeLauncherApp(tk.Tk):
             "author_name", "created_utc", "freecad_version_tested", "launcher_version",
             "description", "copyright", "license_terms", "payload_encryption",
             "payload_hash_sha256", "payload_size_bytes", "payload_file_count",
-            "default_cfg_relpath", "included_files",
+            "default_cfg_relpath", "included_files", "theme_package",
+            "require_external_cfg", "external_cfg_url", "external_cfg_filename",
+            "require_external_qss", "external_qss_url", "external_qss_filename",
         ]
         missing = [key for key in required if key not in manifest]
         if missing:
@@ -2123,12 +2871,26 @@ class ThemeLauncherApp(tk.Tk):
         for rel in included_files:
             if not isinstance(rel, str) or not _is_safe_relpath(rel):
                 raise LauncherError("Theme package contains an unsafe file path.")
-        cfg_rel = str(manifest["default_cfg_relpath"])
-        if cfg_rel not in included_files:
-            raise LauncherError("Theme package default_cfg_relpath is missing from included_files.")
+        artwork_only = _is_artwork_only_theme_package(str(manifest.get("theme_package", "")))
+        cfg_rel = str(manifest["default_cfg_relpath"] or "")
+        if artwork_only:
+            if cfg_rel and cfg_rel not in included_files:
+                raise LauncherError("Theme package default_cfg_relpath is invalid.")
+        else:
+            if cfg_rel not in included_files:
+                raise LauncherError("Theme package default_cfg_relpath is missing from included_files.")
         splash_rel = str(manifest.get("default_splash_relpath", "") or "")
         if splash_rel and splash_rel not in included_files:
             raise LauncherError("Theme package default_splash_relpath is missing from included_files.")
+        if artwork_only:
+            if bool(manifest.get("require_external_cfg")):
+                _external_asset_filename_from_url(str(manifest.get("external_cfg_url", "") or ""), ".cfg")
+                if not str(manifest.get("external_cfg_filename", "") or ""):
+                    raise LauncherError("Theme package is missing external_cfg_filename.")
+            if bool(manifest.get("require_external_qss")):
+                _external_asset_filename_from_url(str(manifest.get("external_qss_url", "") or ""), ".qss")
+                if not str(manifest.get("external_qss_filename", "") or ""):
+                    raise LauncherError("Theme package is missing external_qss_filename.")
 
     def _extract_theme_payload(self, manifest: dict[str, object], payload_enc: bytes) -> tuple[Path, Path]:
         if hashlib.sha256(payload_enc).hexdigest() != str(manifest["payload_hash_sha256"]):
@@ -2162,24 +2924,50 @@ class ThemeLauncherApp(tk.Tk):
             raise
 
     def launch_from_theme_clicked(self) -> None:
+        self._persist_critical_paths()
         self._collect_ui_to_settings()
-        theme_text = self.settings.theme_file.strip()
-        if not theme_text:
-            messagebox.showerror(APP_NAME, "Theme is not selected.")
-            self.append_status("Launch from Theme failed: Theme is not selected.")
-            return
         try:
+            self._persist_settings_silently()
+        except Exception:
+            pass
+        try:
+            resolved_freecad_executable, raw_freecad_executable_text = self._require_freecad_executable_now()
+            theme_text = self.settings.theme_file.strip()
+            if not theme_text:
+                messagebox.showerror(APP_NAME, "Theme is not selected.")
+                self.append_status("Launch from Theme failed: Theme is not selected.")
+                return
             theme_file = Path(theme_text).expanduser()
             if not theme_file.exists() or not theme_file.is_file():
                 raise LauncherError("Theme does not exist or is not a file.")
             manifest, public_pem, signature_b64, payload_enc = self._read_theme_package(theme_file)
             self._validate_theme_manifest(manifest)
             _verify_signature(manifest, public_pem, signature_b64)
+
+            external_assets = self._ensure_required_external_assets_ready(theme_file, manifest)
             extraction_root, theme_root = self._extract_theme_payload(manifest, payload_enc)
 
-            packaged_cfg = theme_root / str(manifest["default_cfg_relpath"])
-            if not packaged_cfg.exists():
-                raise LauncherError("Theme package default .cfg was not found after extraction.")
+            packaged_cfg: Path | None = None
+            cfg_rel = str(manifest.get("default_cfg_relpath", "") or "").strip()
+            if cfg_rel:
+                candidate_cfg = theme_root / cfg_rel
+                if candidate_cfg.exists() and candidate_cfg.is_file():
+                    packaged_cfg = candidate_cfg
+
+            if bool(manifest.get("require_external_cfg")):
+                cfg_source = external_assets.get("cfg")
+                if cfg_source is None or not cfg_source.exists() or not cfg_source.is_file():
+                    raise LauncherError("Required external configuration (.cfg) is not available. Please download the required external assets again.")
+                cfg_writeback_target = cfg_source
+            else:
+                if packaged_cfg is None:
+                    raise LauncherError("Theme package default .cfg was not found after extraction.")
+                permanent_cfg = _theme_user_cfg_path(str(manifest["theme_id"]))
+                permanent_cfg.parent.mkdir(parents=True, exist_ok=True)
+                if not permanent_cfg.exists():
+                    shutil.copy2(packaged_cfg, permanent_cfg)
+                cfg_source = permanent_cfg
+                cfg_writeback_target = permanent_cfg
 
             splash_override_path = None
             splash_rel = str(manifest.get("default_splash_relpath", "") or "")
@@ -2188,18 +2976,22 @@ class ThemeLauncherApp(tk.Tk):
                 if candidate_splash.exists() and candidate_splash.is_file():
                     splash_override_path = candidate_splash
 
-            permanent_cfg = _theme_user_cfg_path(str(manifest["theme_id"]))
-            permanent_cfg.parent.mkdir(parents=True, exist_ok=True)
-            if not permanent_cfg.exists():
-                shutil.copy2(packaged_cfg, permanent_cfg)
+            qss_override_path = None
+            if bool(manifest.get("require_external_qss")):
+                qss_override_path = external_assets.get("qss")
+                if qss_override_path is None or not qss_override_path.exists() or not qss_override_path.is_file():
+                    raise LauncherError("Required external style-sheet (.qss) is not available. Please download the required external assets again.")
 
             self._launch_with_prepared_theme(
                 theme_folder=theme_root,
-                cfg_source=permanent_cfg,
-                cfg_writeback_target=permanent_cfg,
+                cfg_source=cfg_source.resolve(),
+                cfg_writeback_target=cfg_writeback_target.resolve(),
                 source_label=f"Theme File: {theme_file}",
                 cleanup_dir=extraction_root,
                 splash_override_path=splash_override_path,
+                qss_override_path=qss_override_path.resolve() if qss_override_path is not None else None,
+                resolved_freecad_executable=resolved_freecad_executable,
+                raw_freecad_executable_text=raw_freecad_executable_text,
             )
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
@@ -2278,10 +3070,13 @@ class ThemeLauncherApp(tk.Tk):
         self._collect_ui_to_settings()
         errors: list[str] = []
         warnings: list[str] = []
-        exe = _normalize_freecad_executable_path(self.settings.freecad_executable)
+        exe, raw_exe_text = self._resolve_effective_freecad_executable()
         theme_folder = Path(self.settings.theme_folder).expanduser() if self.settings.theme_folder else None
         if not exe or not exe.exists():
-            errors.append("FreeCAD executable is missing or does not exist.")
+            if raw_exe_text:
+                errors.append(f"FreeCAD executable is missing or does not exist.\nConfigured path:\n{raw_exe_text}")
+            else:
+                errors.append("FreeCAD executable is missing or does not exist.")
         if not theme_folder:
             errors.append("Theme Folder is not selected.")
             return False, errors, warnings, None, None, None, None
@@ -2295,6 +3090,34 @@ class ThemeLauncherApp(tk.Tk):
         if qss_path is None:
             warnings.append("No .qss file was found in the Theme Folder. FreeCAD will launch without a stylesheet override.")
         return len(errors) == 0, errors, warnings, cfg_path, qss_path, splash_path, icon_theme_root
+
+    def _require_freecad_executable_now(self) -> tuple[Path, str]:
+        self._persist_path_field("freecad_executable")
+        resolved_executable, raw_executable_text = self._resolve_effective_freecad_executable()
+        if resolved_executable is None or not resolved_executable.exists():
+            autodetected = _autodetect_freecad_executable_path()
+            if autodetected is not None and autodetected.exists():
+                raw_executable_text = str(autodetected)
+                resolved_executable = autodetected
+            else:
+                visible_entry_text = self._current_entry_text("freecad_executable")
+                if visible_entry_text:
+                    raise LauncherError(f"FreeCAD executable is missing or does not exist.\nConfigured path:\n{visible_entry_text}")
+                if raw_executable_text:
+                    raise LauncherError(f"FreeCAD executable is missing or does not exist.\nConfigured path:\n{raw_executable_text}")
+                raise LauncherError("FreeCAD executable is missing or does not exist. Please browse for FreeCAD.exe again.")
+        self.settings.freecad_executable = raw_executable_text or str(resolved_executable)
+        if self.vars.get("freecad_executable") is not None:
+            try:
+                self.vars["freecad_executable"].set(raw_executable_text or str(resolved_executable))
+            except Exception:
+                pass
+        try:
+            self._write_settings_file()
+        except Exception:
+            pass
+        self._write_freecad_executable_fallback(raw_executable_text or str(resolved_executable))
+        return resolved_executable, raw_executable_text or str(resolved_executable)
 
     def validate_clicked(self) -> None:
         ok, errors, warnings, cfg_path, qss_path, splash_path, icon_theme_root = self.validate_theme_folder()
@@ -2341,10 +3164,15 @@ class ThemeLauncherApp(tk.Tk):
         cfg_writeback_target: Path,
         source_label: str,
         splash_override_path: Path | None = None,
+        qss_override_path: Path | None = None,
+        resolved_freecad_executable: Path | None = None,
+        raw_freecad_executable_text: str = "",
     ) -> tuple[list[str], dict[str, str], str, Path]:
         cfg_path, qss_path, splash_path, icon_theme_root, notes = self._scan_specific_theme_folder(theme_folder)
         if splash_override_path is not None and splash_override_path.exists() and splash_override_path.is_file():
             splash_path = splash_override_path
+        if qss_override_path is not None and qss_override_path.exists() and qss_override_path.is_file():
+            qss_path = qss_override_path
         runtime_root = theme_folder / RUNTIME_DIR_NAME
         runtime_root.mkdir(parents=True, exist_ok=True)
         runtime_user_cfg = runtime_root / "user.cfg"
@@ -2385,8 +3213,10 @@ class ThemeLauncherApp(tk.Tk):
                     seen_splash_targets.add(splash_target_key)
         helper_text_path, macro_path = self.write_reload_helper_files(runtime_root, runtime_user_home)
         runtime_startup_script_path: Path | None = None
-        resolved_freecad_executable = _normalize_freecad_executable_path(self.settings.freecad_executable)
+        resolved_freecad_executable, raw_exe_text = self._resolve_effective_freecad_executable()
         if resolved_freecad_executable is None or not resolved_freecad_executable.exists():
+            if raw_exe_text:
+                raise LauncherError(f"FreeCAD executable is missing or does not exist.\nConfigured path:\n{raw_exe_text}")
             raise LauncherError("FreeCAD executable is missing or does not exist.")
         cmd = [str(resolved_freecad_executable.resolve()), "--user-cfg", str(runtime_user_cfg)]
         if runtime_qss_text:
@@ -2671,6 +3501,9 @@ class ThemeLauncherApp(tk.Tk):
         source_label: str,
         cleanup_dir: Path | None = None,
         splash_override_path: Path | None = None,
+        qss_override_path: Path | None = None,
+        resolved_freecad_executable: Path | None = None,
+        raw_freecad_executable_text: str = "",
     ) -> None:
         self.save_settings()
         cmd, env, summary, runtime_user_cfg = self._build_launch_command_for_theme_folder(
@@ -2679,6 +3512,9 @@ class ThemeLauncherApp(tk.Tk):
             cfg_writeback_target=cfg_writeback_target.resolve(),
             source_label=source_label,
             splash_override_path=splash_override_path.resolve() if splash_override_path is not None else None,
+            qss_override_path=qss_override_path.resolve() if qss_override_path is not None else None,
+            resolved_freecad_executable=resolved_freecad_executable.resolve() if resolved_freecad_executable is not None else None,
+            raw_freecad_executable_text=raw_freecad_executable_text,
         )
         self.clear_status()
         self.append_status("Launching FreeCAD...\n")
@@ -2708,7 +3544,9 @@ class ThemeLauncherApp(tk.Tk):
             self.append_status(f"Removed temporary extracted theme: {cleanup_dir}")
 
     def launch_freecad(self) -> None:
+        self._persist_critical_paths()
         try:
+            resolved_freecad_executable, raw_freecad_executable_text = self._require_freecad_executable_now()
             ok, errors, warnings, cfg_path, qss_path, splash_path, icon_theme_root = self.validate_theme_folder()
             if not ok or cfg_path is None:
                 raise LauncherError("\n".join(errors))
@@ -2717,6 +3555,8 @@ class ThemeLauncherApp(tk.Tk):
                 cfg_source=cfg_path.resolve(),
                 cfg_writeback_target=cfg_path.resolve(),
                 source_label="Theme Folder",
+                resolved_freecad_executable=resolved_freecad_executable,
+                raw_freecad_executable_text=raw_freecad_executable_text,
             )
         except Exception as exc:
             messagebox.showerror(APP_NAME, str(exc))
@@ -2783,6 +3623,7 @@ class ThemeLauncherApp(tk.Tk):
         return Path(sys.executable).resolve(), [str(_launcher_entry_path()), mode_arg]
 
     def _create_windows_shortcut(self, shortcut_path: Path, target_path: Path, arguments: list[str], icon_path: Path | None) -> None:
+        persistent_icon_path = _make_shortcut_icon_persistent(shortcut_path, icon_path)
         arg_string = subprocess.list2cmdline(arguments) if arguments else ""
         script = textwrap.dedent(f"""\
             $WshShell = New-Object -ComObject WScript.Shell
@@ -2790,7 +3631,7 @@ class ThemeLauncherApp(tk.Tk):
             $Shortcut.TargetPath = {str(target_path)!r}
             $Shortcut.WorkingDirectory = {str(target_path.parent)!r}
             {f"$Shortcut.Arguments = {arg_string!r}" if arg_string else ""}
-            {f"$Shortcut.IconLocation = {str(icon_path)!r}" if icon_path is not None else ""}
+            {f"$Shortcut.IconLocation = {str(persistent_icon_path)!r}" if persistent_icon_path is not None else ""}
             $Shortcut.Save()
         """)
         subprocess.run(
@@ -2801,6 +3642,7 @@ class ThemeLauncherApp(tk.Tk):
         )
 
     def _create_macos_shortcut(self, shortcut_path: Path, target_path: Path, arguments: list[str], icon_path: Path | None) -> None:
+        persistent_icon_path = _make_shortcut_icon_persistent(shortcut_path, icon_path)
         app_dir = shortcut_path
         contents = app_dir / "Contents"
         macos_dir = contents / "MacOS"
@@ -2824,9 +3666,9 @@ class ThemeLauncherApp(tk.Tk):
         os.chmod(launcher_script, 0o755)
 
         icon_file_name = ""
-        if icon_path is not None and icon_path.exists():
+        if persistent_icon_path is not None and persistent_icon_path.exists():
             icon_file_name = "shortcut.icns"
-            shutil.copy2(icon_path, resources_dir / icon_file_name)
+            shutil.copy2(persistent_icon_path, resources_dir / icon_file_name)
 
         icon_plist_block = ""
         if icon_file_name:
@@ -2863,7 +3705,7 @@ class ThemeLauncherApp(tk.Tk):
 
     def _create_linux_shortcut(self, shortcut_path: Path, target_path: Path, arguments: list[str], icon_path: Path | None) -> None:
         exec_parts = [_desktop_exec_escape(str(target_path))] + [_desktop_exec_escape(part) for part in arguments]
-        persistent_icon_path = _make_linux_shortcut_icon_persistent(shortcut_path, icon_path)
+        persistent_icon_path = _make_shortcut_icon_persistent(shortcut_path, icon_path)
         desktop_text = f"""[Desktop Entry]
 Type=Application
 Version=1.0
@@ -2879,6 +3721,7 @@ Terminal=false
         _mark_linux_shortcut_trusted(shortcut_path, persistent_icon_path)
 
     def create_shortcut_clicked(self) -> None:
+        self._persist_critical_paths()
         self._collect_ui_to_settings()
         self.save_settings()
         default_location = str(Path.home() / "Desktop")
@@ -2962,6 +3805,7 @@ def _quote_arg(value: str) -> str:
 def _load_saved_settings_for_headless_launch() -> AppSettings:
     settings_candidates: list[Path] = []
     primary_settings_path = _settings_storage_path(_resource_base_dir())
+    executable_fallback_path = _freecad_executable_fallback_path(_resource_base_dir())
     settings_candidates.append(primary_settings_path)
 
     legacy_local_settings_path = Path(__file__).resolve().parent / SETTINGS_FILE
@@ -2971,10 +3815,7 @@ def _load_saved_settings_for_headless_launch() -> AppSettings:
     for settings_path in settings_candidates:
         if settings_path.exists():
             try:
-                data = json.loads(settings_path.read_text(encoding="utf-8"))
-                defaults = asdict(AppSettings())
-                defaults.update(data)
-                return AppSettings(**defaults)
+                return _load_app_settings_from_path(settings_path)
             except Exception as exc:
                 raise LauncherError(f"Could not read saved settings:\n{exc}") from exc
 
@@ -3076,6 +3917,14 @@ def _read_theme_package_metadata(theme_file: Path) -> dict[str, str]:
         "license_notice": "",
         "license": "",
         "license_text": "",
+        "theme_package": THEME_PACKAGE_MODE_COMPLETE,
+        "require_external_cfg": "0",
+        "external_cfg_url": "",
+        "external_cfg_filename": "",
+        "require_external_qss": "0",
+        "external_qss_url": "",
+        "external_qss_filename": "",
+        "theme_id": "",
     }
     try:
         with zipfile.ZipFile(theme_file, "r") as outer_zip:
@@ -3101,6 +3950,14 @@ def _read_theme_package_metadata(theme_file: Path) -> dict[str, str]:
             "license_notice": str(manifest.get("license_notice", "") or ""),
             "license": str(manifest.get("license", "") or ""),
             "license_text": str(license_text or ""),
+            "theme_package": str(manifest.get("theme_package", THEME_PACKAGE_MODE_COMPLETE) or THEME_PACKAGE_MODE_COMPLETE),
+            "require_external_cfg": "1" if bool(manifest.get("require_external_cfg")) else "0",
+            "external_cfg_url": str(manifest.get("external_cfg_url", "") or ""),
+            "external_cfg_filename": str(manifest.get("external_cfg_filename", "") or ""),
+            "require_external_qss": "1" if bool(manifest.get("require_external_qss")) else "0",
+            "external_qss_url": str(manifest.get("external_qss_url", "") or ""),
+            "external_qss_filename": str(manifest.get("external_qss_filename", "") or ""),
+            "theme_id": str(manifest.get("theme_id", "") or ""),
         }
     except Exception:
         return empty
