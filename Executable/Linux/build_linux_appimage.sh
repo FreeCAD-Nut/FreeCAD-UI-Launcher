@@ -17,7 +17,7 @@ mkdir -p "$WORK_DIR"
 python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
-pip install pyinstaller cryptography
+pip install pyinstaller cryptography certifi
 
 rm -rf "$DIST_DIR" "$BUILD_DIR" "$SPEC_DIR" "$APPDIR" "$OUTPUT"
 

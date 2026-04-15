@@ -47,9 +47,15 @@ from typing import Callable
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
+import ssl
+
+try:
+    import certifi  # type: ignore
+except Exception:  # pragma: no cover - fallback when certifi is unavailable
+    certifi = None
 
 APP_NAME = "UI Launcher"
-APP_VERSION = "1.51.7"
+APP_VERSION = "1.51.8"
 SETTINGS_FILE = "UI_Launcher_settings.json"
 RUNTIME_DIR_NAME = ".UI_Launcher_runtime"
 DEFAULT_SHORTCUT_ICONS_DIR_NAME = "Default_Shortcut_Icons"
@@ -689,13 +695,30 @@ def _download_url_bytes(url: str, expected_suffix: str | None = None) -> bytes:
         normalized_url,
         headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
     )
+    ssl_context = None
+    parsed = urllib_parse.urlparse(normalized_url)
+    if parsed.scheme.lower() == "https" and certifi is not None:
+        try:
+            cafile = certifi.where()
+            if cafile:
+                ssl_context = ssl.create_default_context(cafile=cafile)
+        except Exception:
+            ssl_context = None
     try:
-        with urllib_request.urlopen(request, timeout=30) as response:
+        with urllib_request.urlopen(request, timeout=30, context=ssl_context) as response:
             data = response.read()
     except urllib_error.HTTPError as exc:
         raise LauncherError(f"Download failed ({exc.code}) for:\n{url}") from exc
     except urllib_error.URLError as exc:
-        raise LauncherError(f"Could not download required external asset:\n{url}\n\n{exc}") from exc
+        cert_hint = ""
+        reason_text = str(exc.reason) if getattr(exc, "reason", None) else str(exc)
+        if parsed.scheme.lower() == "https" and "CERTIFICATE_VERIFY_FAILED" in reason_text and platform.system() == "Darwin":
+            cert_hint = (
+                "\n\nThe macOS app could not validate the HTTPS certificate chain. "
+                "This build is expected to use the bundled certifi CA bundle; if the problem persists, rebuild the app "
+                "with certifi installed so the CA bundle is included in the packaged runtime."
+            )
+        raise LauncherError(f"Could not download required external asset:\n{url}\n\n{exc}{cert_hint}") from exc
 
     if expected_suffix in {".cfg", ".qss"} and _looks_like_html_bytes(data):
         raise LauncherError(
@@ -704,7 +727,6 @@ def _download_url_bytes(url: str, expected_suffix: str | None = None) -> bytes:
             f"URL:\n{url}\n\nResolved download URL:\n{normalized_url}"
         )
     return data
-
 
 def _make_obscured_temp_dir() -> Path:
     path = Path(tempfile.gettempdir()) / f".uix_{secrets.token_hex(8)}"

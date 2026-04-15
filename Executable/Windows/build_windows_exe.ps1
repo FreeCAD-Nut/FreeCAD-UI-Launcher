@@ -15,7 +15,7 @@ python -m venv $venvDir
 $pythonExe = Join-Path $venvDir 'Scripts\python.exe'
 
 & $pythonExe -m pip install --upgrade pip
-& $pythonExe -m pip install pyinstaller cryptography
+& $pythonExe -m pip install pyinstaller cryptography certifi
 
 if (Test-Path $outputExe) {
     Remove-Item $outputExe -Force
